@@ -6,7 +6,7 @@ on:
       signum_agent_image:
         description: "Container image to use (include tag). Avoid :latest for reliability."
         required: false
-        default: "repo.keyfactor.com/images/signum-agent:latest"
+        default: "repo.keyfactor.com/hsm-drivers-cache/signum-agent:latest"
   push:
     branches: ["main"]
     paths:
@@ -20,7 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SIGNUM_REGISTRY: repo.keyfactor.com
-      DEFAULT_SIGNUM_AGENT_IMAGE: repo.keyfactor.com/images/signum-agent:latest
+      # Default image if no input is provided
+      DEFAULT_SIGNUM_AGENT_IMAGE: repo.keyfactor.com/hsm-drivers-cache/signum-agent:latest
 
     steps:
       - name: Checkout
@@ -39,6 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "== Hitting https://${SIGNUM_REGISTRY}/v2/ =="
+          # NOTE: 401 here is expected without credentials; this is just for debug.
           curl -sI "https://${SIGNUM_REGISTRY}/v2/" | sed -n '1,25p'
 
       # Create these repo secrets:
