@@ -34,28 +34,16 @@ jobs:
           Support issues: https://support.keyfactor.com/
           EOF
 
-      - name: Configure Docker auth for repo.keyfactor.com
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p ~/.docker
-          cat > ~/.docker/config.json <<EOF
-          {
-            "auths": {
-              "${SIGNUM_REGISTRY}": {
-                "auth": "${{ secrets.JFROG_DOCKER_AUTH }}"
-              }
-            }
-          }
-          EOF
-
-          echo "== Docker auth configured for =="
-          python3 - <<'PY'
-          import json, os
-          with open(os.path.expanduser("~/.docker/config.json")) as f:
-              cfg=json.load(f)
-          print(list(cfg.get("auths", {}).keys()))
-          PY
+      # Prefer docker/login-action over writing config.json by hand.
+      # Create these repo secrets:
+      # - JFROG_USERNAME
+      # - JFROG_TOKEN (or password)
+      - name: Docker login (repo.keyfactor.com)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.SIGNUM_REGISTRY }}
+          username: ${{ secrets.JFROG_USERNAME }}
+          password: ${{ secrets.JFROG_TOKEN }}
 
       - name: Run Signum Agent container and list available certs (debug)
         shell: bash
@@ -84,6 +72,9 @@ jobs:
           if [ ! -f "filestosign/example-script.ps1" ]; then
             echo 'Write-Host "Hello from Signum signing demo"' > filestosign/example-script.ps1
           fi
+
+          echo "== Validate registry endpoint (/v2/) =="
+          curl -sI "https://${SIGNUM_REGISTRY}/v2/" | head -n 20 || true
 
           echo "== Validate image ref (manifest) =="
           docker manifest inspect "${SIGNUM_AGENT_IMAGE}" >/dev/null
