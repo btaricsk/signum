@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       signum_agent_image:
-        description: "Container image to use (include tag)."
+        description: "Container image to use (include tag). Avoid :latest for reliability."
         required: false
-        default: "repo.keyfactor.com/images/signum-agent:latest"
+        default: "repo.keyfactor.com/images/signum-agent:4.20.0"
   push:
     branches: ["main"]
     paths:
@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SIGNUM_REGISTRY: repo.keyfactor.com
-      DEFAULT_SIGNUM_AGENT_IMAGE: repo.keyfactor.com/images/signum-agent:latest
+      DEFAULT_SIGNUM_AGENT_IMAGE: repo.keyfactor.com/images/signum-agent:4.20.0
 
     steps:
       - name: Checkout
@@ -34,16 +34,35 @@ jobs:
           Support issues: https://support.keyfactor.com/
           EOF
 
-      # Prefer docker/login-action over writing config.json by hand.
+      - name: Check registry endpoint (/v2/)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "== Hitting https://${SIGNUM_REGISTRY}/v2/ =="
+          curl -sI "https://${SIGNUM_REGISTRY}/v2/" | sed -n '1,25p'
+
       # Create these repo secrets:
       # - JFROG_USERNAME
-      # - JFROG_TOKEN (or password)
+      # - JFROG_TOKEN (or password / access token)
       - name: Docker login (repo.keyfactor.com)
         uses: docker/login-action@v3
         with:
           registry: ${{ env.SIGNUM_REGISTRY }}
           username: ${{ secrets.JFROG_USERNAME }}
           password: ${{ secrets.JFROG_TOKEN }}
+          logout: true
+
+      - name: Resolve agent image ref
+        id: img
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="${{ inputs.signum_agent_image }}"
+          if [ -z "${IMG}" ]; then
+            IMG="${DEFAULT_SIGNUM_AGENT_IMAGE}"
+          fi
+          echo "image=${IMG}" >> "$GITHUB_OUTPUT"
+          echo "Using agent image: ${IMG}"
 
       - name: Run Signum Agent container and list available certs (debug)
         shell: bash
@@ -52,7 +71,7 @@ jobs:
           SIGNUM_CLIENTID: ${{ secrets.SIGNUM_CLIENTID }}
           SIGNUM_USERNAME: ${{ secrets.SIGNUM_USERNAME }}
           SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
-          SIGNUM_AGENT_IMAGE: ${{ inputs.signum_agent_image || env.DEFAULT_SIGNUM_AGENT_IMAGE }}
+          SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
         run: |
           set -euo pipefail
 
@@ -73,16 +92,11 @@ jobs:
             echo 'Write-Host "Hello from Signum signing demo"' > filestosign/example-script.ps1
           fi
 
-          echo "== Validate registry endpoint (/v2/) =="
-          curl -sI "https://${SIGNUM_REGISTRY}/v2/" | head -n 20 || true
-
-          echo "== Validate image ref (manifest) =="
-          docker manifest inspect "${SIGNUM_AGENT_IMAGE}" >/dev/null
-
           echo "== Pull Signum agent image =="
           docker pull "${SIGNUM_AGENT_IMAGE}"
 
           echo "== Run container =="
+          docker rm -f signum-agent >/dev/null 2>&1 || true
           docker run --name signum-agent -d \
             -v "$PWD/filestosign:/mnt/filestosign" \
             -e "SIGNUM_HOSTNAME=$SIGNUM_HOSTNAME" \
@@ -94,7 +108,7 @@ jobs:
             "${SIGNUM_AGENT_IMAGE}"
 
           echo "== Container status =="
-          docker ps -a | sed -n '1,10p'
+          docker ps -a | sed -n '1,15p'
 
           echo "== List certs (signum-util lc) =="
           docker exec signum-agent signum-util lc | tee signum-certs.txt
