@@ -1,4 +1,4 @@
-name: Sign document with Signum Container Agent (basic with)
+name: Sign document with Signum Container Agent (basic)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       signum_agent_image:
         description: "Container image to use (include tag)."
         required: false
-        default: "repo.keyfactor.com/images/signum-agent:latest"
+        default: "repo.keyfactor.com/images/signum-agent:4.20.0"
   push:
     branches: ["main"]
     paths:
@@ -18,9 +18,9 @@ permissions:
 jobs:
   sign:
     runs-on: ubuntu-latest
-
     env:
       SIGNUM_REGISTRY: repo.keyfactor.com
+      DEFAULT_SIGNUM_AGENT_IMAGE: repo.keyfactor.com/images/signum-agent:4.20.0
 
     steps:
       - name: Checkout
@@ -34,7 +34,7 @@ jobs:
           Support issues: https://support.keyfactor.com/
           EOF
 
-      - name: Configure Docker auth for JFrog Artifactory (repo.keyfactor.com)
+      - name: Configure Docker auth for repo.keyfactor.com
         shell: bash
         run: |
           set -euo pipefail
@@ -43,8 +43,7 @@ jobs:
           {
             "auths": {
               "${SIGNUM_REGISTRY}": {
-                "auth": "${{ secrets.JFROG_DOCKER_AUTH }}",
-                "email": "youremail@email.com"
+                "auth": "${{ secrets.JFROG_DOCKER_AUTH }}"
               }
             }
           }
@@ -65,7 +64,7 @@ jobs:
           SIGNUM_CLIENTID: ${{ secrets.SIGNUM_CLIENTID }}
           SIGNUM_USERNAME: ${{ secrets.SIGNUM_USERNAME }}
           SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
-          SIGNUM_AGENT_IMAGE: ${{ github.event.inputs.signum_agent_image || 'repo.keyfactor.com/images/signum-agent:latest' }}
+          SIGNUM_AGENT_IMAGE: ${{ inputs.signum_agent_image || env.DEFAULT_SIGNUM_AGENT_IMAGE }}
         run: |
           set -euo pipefail
 
