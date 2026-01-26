@@ -20,7 +20,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SIGNUM_REGISTRY: repo.keyfactor.com
-      # Default image if no input is provided
       DEFAULT_SIGNUM_AGENT_IMAGE: repo.keyfactor.com/hsm-drivers-cache/signum-agent:latest
 
     steps:
@@ -34,14 +33,6 @@ jobs:
           ## Signum Container Agent with Signing Tools – Support / Usage Notes
           Support issues: https://support.keyfactor.com/
           EOF
-
-      - name: Check registry endpoint (/v2/)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "== Hitting https://${SIGNUM_REGISTRY}/v2/ =="
-          # NOTE: 401 here is expected without credentials; this is just for debug.
-          curl -sI "https://${SIGNUM_REGISTRY}/v2/" | sed -n '1,25p'
 
       # Create these repo secrets:
       # - JFROG_USERNAME
