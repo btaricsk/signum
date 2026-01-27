@@ -1,54 +1,9 @@
-name: Download Signum linux agent from JFrog Generic Repo
-
-on:
-  workflow_dispatch:
-  push:
-    branches: ["main"]
-    paths:
-      - "filestosign/**"
-
-permissions:
-  contents: read
-
-jobs:
-  sign:
-    runs-on: ubuntu-latest
-    env:
-      # Generic repo base (NOT Docker registry)
-      JFROG_BASE_URL: https://keyfactor.jfrog.io/artifactory
-      JFROG_REPO: signum-bdewberry-testing
-
-      # Parent folder (NOT "latest" as a file)
-      AGENT_PARENT_PATH: keyfactor/signum-linux-agent
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Notes / Support Disclaimer
-        shell: bash
-        run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
-          ## Signum Agent – Support / Usage Notes
-          Support issues: https://support.keyfactor.com/
-          EOF
-
-      - name: Validate JFrog credentials present
-        shell: bash
-        env:
-          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
-          JFROG_TOKEN:    ${{ secrets.JFROG_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${JFROG_USERNAME:-}" ] || [ -z "${JFROG_TOKEN:-}" ]; then
-            echo "Missing secrets. Add JFROG_USERNAME and JFROG_TOKEN (API key/password recommended)."
-            exit 1
-          fi
-          echo "JFrog credentials present."
-
       - name: Download latest Signum linux agent (resolve real file via storage API)
         shell: bash
         env:
+          JFROG_BASE_URL: https://keyfactor.jfrog.io/artifactory
+          JFROG_REPO: signum-bdewberry-testing
+          AGENT_PARENT_PATH: keyfactor/signum-linux-agent
           JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
           JFROG_TOKEN:    ${{ secrets.JFROG_TOKEN }}
         run: |
@@ -56,50 +11,57 @@ jobs:
 
           mkdir -p signum-agent-download
 
-          storage_api () {
-            local p="$1"
-            curl -fsS -u "${JFROG_USERNAME}:${JFROG_TOKEN}" \
-              "${JFROG_BASE_URL%/}/api/storage/${JFROG_REPO}/${p}"
-          }
-
-          echo "== Resolving agent file via storage API =="
-          echo "Repo: ${JFROG_REPO}"
-          echo "Parent: ${AGENT_PARENT_PATH}"
-
           FILE_PATH="$(python3 - <<'PY'
-          import json, os, subprocess, sys
+          import base64, json, os, sys, urllib.request, urllib.error
 
+          base = os.environ["JFROG_BASE_URL"].rstrip("/")
           repo = os.environ["JFROG_REPO"]
           parent = os.environ["AGENT_PARENT_PATH"].strip("/")
+          user = os.environ["JFROG_USERNAME"]
+          token = os.environ["JFROG_TOKEN"]
 
-          def storage(path: str) -> dict:
-            cmd = ["bash","-lc", f'storage_api "{path}"']
-            out = subprocess.check_output(cmd, text=True)
-            return json.loads(out)
+          def get_json(url: str) -> dict:
+            req = urllib.request.Request(url)
+            auth = base64.b64encode(f"{user}:{token}".encode()).decode()
+            req.add_header("Authorization", f"Basic {auth}")
+            req.add_header("Accept", "application/json")
+            with urllib.request.urlopen(req) as resp:
+              return json.loads(resp.read().decode())
 
-          def looks_like_file(uri: str) -> bool:
-            name = uri.strip("/").split("/")[-1]
-            return "." in name  # crude but effective for generic repos
+          def children(path: str):
+            url = f"{base}/api/storage/{repo}/{path}"
+            j = get_json(url)
+            return [c["uri"].lstrip("/") for c in j.get("children", [])]
 
-          # list children of parent
-          parent_json = storage(parent)
-          children = [c["uri"].lstrip("/") for c in parent_json.get("children", [])]
-          if not children:
-            print(f"No children found under {parent}", file=sys.stderr)
+          def looks_like_file(name: str) -> bool:
+            # Generic repos usually have extensions; this is a heuristic
+            return "." in name.split("/")[-1]
+
+          # 1) list parent
+          kids = children(parent)
+          if not kids:
+            print(f"No children under {parent}", file=sys.stderr)
             sys.exit(1)
 
-          # prefer "latest" folder if it exists, else choose lexicographically last child
-          chosen = f"{parent}/latest" if "latest" in children else f"{parent}/" + sorted(children)[-1]
+          # prefer 'latest' folder if present, else choose lexicographically last child
+          chosen = f"{parent}/latest" if "latest" in kids else f"{parent}/" + sorted(kids)[-1]
 
+          # 2) resolve down to a file
           def resolve_to_file(path: str) -> str:
-            j = storage(path)
-            kids = [c["uri"].lstrip("/") for c in j.get("children", [])]
-            if kids:
-              files = [k for k in kids if looks_like_file(k)]
+            try:
+              kids2 = children(path)
+            except urllib.error.HTTPError as e:
+              # If storage API returns non-JSON for a file, treat as file
+              if e.code in (404, 400):
+                return path
+              raise
+
+            if kids2:
+              files = [k for k in kids2 if looks_like_file(k)]
               if files:
                 return path.rstrip("/") + "/" + sorted(files)[0]
               # descend into first child folder
-              return resolve_to_file(path.rstrip("/") + "/" + sorted(kids)[0])
+              return resolve_to_file(path.rstrip("/") + "/" + sorted(kids2)[0])
             return path
 
           print(resolve_to_file(chosen))
@@ -113,13 +75,13 @@ jobs:
 
           echo "Downloading from:"
           echo "${FILE_URL}"
+
           curl -fLsS -u "${JFROG_USERNAME}:${JFROG_TOKEN}" -o "${OUT}" "${FILE_URL}"
 
           echo "== Downloaded file info =="
           ls -lah signum-agent-download
           file "${OUT}" || true
 
-          # If it's an archive, extract it
           if file "${OUT}" | grep -qiE 'zip archive'; then
             echo "Detected ZIP; extracting..."
             unzip -o "${OUT}" -d signum-agent-download
@@ -131,11 +93,3 @@ jobs:
           echo "### Downloaded Signum agent artifact" >> "$GITHUB_STEP_SUMMARY"
           echo "- Source: ${FILE_URL}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Output: ${OUT}" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload downloaded artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: signum-agent-generic-download
-          path: |
-            signum-agent-download/**
