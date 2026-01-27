@@ -6,7 +6,7 @@ on:
       signum_agent_image:
         description: "Container image to use (include tag). Avoid :latest for reliability."
         required: false
-        default: "repo.keyfactor.com/hsm-drivers-cache/signum-agent:latest"
+        default: "repo.keyfactor.com/images/signum-agent:4.60.2"
   push:
     branches: ["main"]
     paths:
@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SIGNUM_REGISTRY: repo.keyfactor.com
-      DEFAULT_SIGNUM_AGENT_IMAGE: repo.keyfactor.com/hsm-drivers-cache/signum-agent:latest
+      DEFAULT_SIGNUM_AGENT_IMAGE: repo.keyfactor.com/images/signum-agent:4.60.2
 
     steps:
       - name: Checkout
