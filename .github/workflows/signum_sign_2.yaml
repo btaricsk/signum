@@ -45,14 +45,20 @@ jobs:
       - name: Validate required secrets are present
         id: check_secrets
         shell: bash
+        env:
+          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
+          JFROG_TOKEN:    ${{ secrets.JFROG_TOKEN }}
+          SIGNUM_HOSTNAME: ${{ secrets.SIGNUM_HOSTNAME }}
+          SIGNUM_USERNAME: ${{ secrets.SIGNUM_USERNAME }}
+          SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
         run: |
           set -euo pipefail
           missing=()
-          test -n "${{ secrets.JFROG_USERNAME:- }}" || missing+=("JFROG_USERNAME")
-          test -n "${{ secrets.JFROG_TOKEN:- }}" || missing+=("JFROG_TOKEN")
-          test -n "${{ secrets.SIGNUM_HOSTNAME:- }}" || missing+=("SIGNUM_HOSTNAME")
-          test -n "${{ secrets.SIGNUM_USERNAME:- }}" || missing+=("SIGNUM_USERNAME")
-          test -n "${{ secrets.SIGNUM_PASSWORD:- }}" || missing+=("SIGNUM_PASSWORD")
+          test -n "${JFROG_USERNAME:-}" || missing+=("JFROG_USERNAME")
+          test -n "${JFROG_TOKEN:-}" || missing+=("JFROG_TOKEN")
+          test -n "${SIGNUM_HOSTNAME:-}" || missing+=("SIGNUM_HOSTNAME")
+          test -n "${SIGNUM_USERNAME:-}" || missing+=("SIGNUM_USERNAME")
+          test -n "${SIGNUM_PASSWORD:-}" || missing+=("SIGNUM_PASSWORD")
           if [ "${#missing[@]}" -ne 0 ]; then
             echo "Required secrets missing: ${missing[*]}"
             echo "Please add them under Settings → Secrets and variables → Actions"
@@ -114,7 +120,7 @@ jobs:
           echo "== Run container =="
           docker rm -f signum-agent >/dev/null 2>&1 || true
 
-          # <-- THIS is the docker run you asked to add; using secrets so creds are not exposed in logs
+          # <-- The docker run you requested
           docker run --name signum-agent -d \
             -v "$PWD/filestosign:/mnt/filestosign" \
             -e "SIGNUM_HOSTNAME=${SIGNUM_HOSTNAME}" \
