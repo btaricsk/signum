@@ -1,11 +1,53 @@
+name: Download latest Signum linux agent (resolve real file via storage API)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - "filestosign/**"
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    env:
+      JFROG_BASE_URL: https://keyfactor.jfrog.io/artifactory
+      JFROG_REPO: signum-bdewberry-testing
+      AGENT_PARENT_PATH: keyfactor/signum-linux-agent
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Notes / Support Disclaimer
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Signum Agent – Support / Usage Notes
+          Support issues: https://support.keyfactor.com/
+          EOF
+
+      - name: Validate JFrog credentials present
+        shell: bash
+        env:
+          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
+          JFROG_TOKEN: ${{ secrets.JFROG_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${JFROG_USERNAME:-}" ] || [ -z "${JFROG_TOKEN:-}" ]; then
+            echo "Missing secrets. Add JFROG_USERNAME and JFROG_TOKEN."
+            exit 1
+          fi
+          echo "JFrog credentials present."
+
       - name: Download latest Signum linux agent (resolve real file via storage API)
         shell: bash
         env:
-          JFROG_BASE_URL: https://keyfactor.jfrog.io/artifactory
-          JFROG_REPO: signum-bdewberry-testing
-          AGENT_PARENT_PATH: keyfactor/signum-linux-agent
           JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
-          JFROG_TOKEN:    ${{ secrets.JFROG_TOKEN }}
+          JFROG_TOKEN: ${{ secrets.JFROG_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -34,33 +76,25 @@
             return [c["uri"].lstrip("/") for c in j.get("children", [])]
 
           def looks_like_file(name: str) -> bool:
-            # Generic repos usually have extensions; this is a heuristic
             return "." in name.split("/")[-1]
 
-          # 1) list parent
           kids = children(parent)
           if not kids:
             print(f"No children under {parent}", file=sys.stderr)
             sys.exit(1)
 
-          # prefer 'latest' folder if present, else choose lexicographically last child
           chosen = f"{parent}/latest" if "latest" in kids else f"{parent}/" + sorted(kids)[-1]
 
-          # 2) resolve down to a file
           def resolve_to_file(path: str) -> str:
             try:
               kids2 = children(path)
-            except urllib.error.HTTPError as e:
-              # If storage API returns non-JSON for a file, treat as file
-              if e.code in (404, 400):
-                return path
-              raise
+            except urllib.error.HTTPError:
+              return path
 
             if kids2:
               files = [k for k in kids2 if looks_like_file(k)]
               if files:
                 return path.rstrip("/") + "/" + sorted(files)[0]
-              # descend into first child folder
               return resolve_to_file(path.rstrip("/") + "/" + sorted(kids2)[0])
             return path
 
@@ -70,7 +104,7 @@
 
           echo "Resolved file path: ${FILE_PATH}"
 
-          FILE_URL="${JFROG_BASE_URL%/}/${JFROG_REPO}/${FILE_PATH}"
+          FILE_URL="${JFROG_BASE_URL}/${JFROG_REPO}/${FILE_PATH}"
           OUT="signum-agent-download/$(basename "${FILE_PATH}")"
 
           echo "Downloading from:"
@@ -83,13 +117,19 @@
           file "${OUT}" || true
 
           if file "${OUT}" | grep -qiE 'zip archive'; then
-            echo "Detected ZIP; extracting..."
             unzip -o "${OUT}" -d signum-agent-download
           elif file "${OUT}" | grep -qiE 'gzip compressed|tar archive'; then
-            echo "Detected tar/gz; extracting..."
             tar -xf "${OUT}" -C signum-agent-download || tar -xzf "${OUT}" -C signum-agent-download
           fi
 
           echo "### Downloaded Signum agent artifact" >> "$GITHUB_STEP_SUMMARY"
           echo "- Source: ${FILE_URL}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Output: ${OUT}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload downloaded artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signum-agent-generic-download
+          path: |
+            signum-agent-download/**
