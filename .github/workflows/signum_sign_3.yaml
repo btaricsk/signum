@@ -2,11 +2,6 @@ name: Sign document with Signum Container Agent (basic)
 
 on:
   workflow_dispatch:
-    inputs:
-      signum_agent_image:
-        description: "Full image ref to pull/run (include tag)."
-        required: false
-        default: "keyfactor.jfrog.io/signum-bdewberry-testing-docker/signum-agent:4.60.2"
   push:
     branches: ["main"]
     paths:
@@ -19,8 +14,13 @@ jobs:
   sign:
     runs-on: ubuntu-latest
     env:
-      SIGNUM_REGISTRY: keyfactor.jfrog.io
-      DEFAULT_SIGNUM_AGENT_IMAGE: keyfactor.jfrog.io/signum-bdewberry-testing-docker/signum-agent:4.60.2
+      # Generic repo base (NOT Docker registry)
+      JFROG_BASE_URL: https://keyfactor.jfrog.io/artifactory
+      JFROG_REPO: signum-bdewberry-testing
+
+      # Path you described in the UI:
+      # signum-bdewberry-testing > keyfactor > signum-linux-agent > latest
+      AGENT_OBJECT_PATH: keyfactor/signum-linux-agent/latest
 
     steps:
       - name: Checkout
@@ -30,44 +30,15 @@ jobs:
         shell: bash
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
-          ## Signum Container Agent with Signing Tools – Support / Usage Notes
+          ## Signum Agent – Support / Usage Notes
           Support issues: https://support.keyfactor.com/
           EOF
-
-      - name: Resolve agent image ref
-        id: img
-        shell: bash
-        run: |
-          set -euo pipefail
-          IMG="${{ inputs.signum_agent_image }}"
-          if [ -z "${IMG}" ]; then
-            IMG="${DEFAULT_SIGNUM_AGENT_IMAGE}"
-          fi
-          echo "image=${IMG}" >> "$GITHUB_OUTPUT"
-          echo "Using agent image: ${IMG}"
-
-      - name: Try anonymous docker pull (no login)
-        id: anon_pull
-        shell: bash
-        env:
-          SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
-        run: |
-          set -euo pipefail
-          echo "=== Attempting anonymous docker pull of ${SIGNUM_AGENT_IMAGE} ==="
-          if docker pull "${SIGNUM_AGENT_IMAGE}"; then
-            echo "pulled=anonymous" >> "$GITHUB_OUTPUT"
-            echo "Anonymous pull succeeded."
-          else
-            echo "pulled=failed" >> "$GITHUB_OUTPUT"
-            echo "Anonymous pull failed."
-          fi
 
       - name: Detect presence of JFrog credentials
         id: detect_creds
         shell: bash
         env:
           JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
-          # Put your JFrog API Key (recommended) or password in this secret:
           JFROG_TOKEN:    ${{ secrets.JFROG_TOKEN }}
         run: |
           set -euo pipefail
@@ -78,75 +49,63 @@ jobs:
           echo "creds_present=${creds_present}" >> "$GITHUB_OUTPUT"
           echo "Detected creds_present=${creds_present}"
 
-      - name: Docker login (keyfactor.jfrog.io) — only if creds exist and anon pull failed
-        if: ${{ steps.detect_creds.outputs.creds_present == 'true' && steps.anon_pull.outputs.pulled != 'anonymous' }}
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.SIGNUM_REGISTRY }}
-          username: ${{ secrets.JFROG_USERNAME }}
-          password: ${{ secrets.JFROG_TOKEN }}
-          logout: true
-
-      - name: Pull image after login (if needed)
-        if: ${{ steps.anon_pull.outputs.pulled != 'anonymous' }}
+      - name: Download Signum linux agent (Generic repo)
         shell: bash
         env:
-          SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
-        run: |
-          set -euo pipefail
-          docker pull "${SIGNUM_AGENT_IMAGE}"
-
-      - name: Run Signum Agent container and list available certs (debug)
-        shell: bash
-        env:
-          SIGNUM_HOSTNAME: ${{ secrets.SIGNUM_HOSTNAME }}
-          SIGNUM_CLIENTID: ${{ secrets.SIGNUM_CLIENTID }}
-          SIGNUM_USERNAME: ${{ secrets.SIGNUM_USERNAME }}
-          SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
-          SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
+          CREDS_PRESENT: ${{ steps.detect_creds.outputs.creds_present }}
+          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
+          JFROG_TOKEN:    ${{ secrets.JFROG_TOKEN }}
         run: |
           set -euo pipefail
 
-          echo "== Ensure there is something to sign =="
-          mkdir -p filestosign
-          if [ ! -f "filestosign/example-script.ps1" ]; then
-            echo 'Write-Host "Hello from Signum signing demo"' > filestosign/example-script.ps1
+          mkdir -p signum-agent-download
+
+          FILE_URL="${JFROG_BASE_URL}/${JFROG_REPO}/${AGENT_OBJECT_PATH}"
+          OUT="signum-agent-download/signum-linux-agent-latest"
+
+          echo "Attempting download from:"
+          echo "${FILE_URL}"
+
+          # Prefer anonymous first; if it fails and creds exist, retry with basic auth.
+          if curl -fLsS -o "${OUT}" "${FILE_URL}"; then
+            echo "Downloaded anonymously to ${OUT}"
+          else
+            echo "Anonymous download failed."
+            if [ "${CREDS_PRESENT}" = "true" ]; then
+              echo "Retrying with credentials..."
+              curl -fLsS -u "${JFROG_USERNAME}:${JFROG_TOKEN}" -o "${OUT}" "${FILE_URL}"
+              echo "Downloaded with credentials to ${OUT}"
+            else
+              echo "No JFrog credentials available. Add secrets JFROG_USERNAME and JFROG_TOKEN."
+              exit 1
+            fi
           fi
 
-          echo "== Run container =="
-          docker rm -f signum-agent >/dev/null 2>&1 || true
+          echo "== File info =="
+          ls -lah signum-agent-download
+          file "${OUT}" || true
 
-          docker run --name signum-agent -d \
-            -v "$PWD/filestosign:/mnt/filestosign" \
-            -e "SIGNUM_HOSTNAME=${SIGNUM_HOSTNAME}" \
-            -e "SIGNUM_USERNAME=${SIGNUM_USERNAME}" \
-            -e "SIGNUM_PASSWORD=${SIGNUM_PASSWORD}" \
-            -e "SIGNUM_LOGLEVEL=HIGH" \
-            -e "SIGNUM_LOGTYPE=FILE" \
-            "${SIGNUM_AGENT_IMAGE}"
+          # If it's an archive, extract it
+          if file "${OUT}" | grep -qiE 'zip archive'; then
+            echo "Detected ZIP; extracting..."
+            unzip -o "${OUT}" -d signum-agent-download
+          elif file "${OUT}" | grep -qiE 'gzip compressed|tar archive'; then
+            echo "Detected tar/gz; extracting..."
+            tar -xf "${OUT}" -C signum-agent-download || tar -xzf "${OUT}" -C signum-agent-download
+          fi
 
-          echo "== Container status =="
-          docker ps -a | sed -n '1,15p'
+          echo "### Downloaded Signum agent artifact" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source: ${FILE_URL}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Output dir: signum-agent-download/" >> "$GITHUB_STEP_SUMMARY"
 
-          echo "== List certs (signum-util lc) =="
-          docker exec signum-agent signum-util lc | tee signum-certs.txt || true
-
-          echo "### Signum cert listing (signum-util lc)" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          if [ -f signum-certs.txt ]; then cat signum-certs.txt >> "$GITHUB_STEP_SUMMARY"; fi
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Cleanup container
-        if: always()
-        shell: bash
-        run: |
-          docker rm -f signum-agent >/dev/null 2>&1 || true
-
-      - name: Upload output
+      - name: Upload downloaded artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: signum-output
+          name: signum-agent-generic-download
           path: |
-            signum-certs.txt
-            filestosign/example-script.ps1
+            signum-agent-download/**
+
+      # ---- Optional: Keep your original container flow if you ALSO have a Docker repo image ----
+      # If you still want to run the container agent image, keep your docker pull/run steps here,
+      # but note: Docker images must come from a Docker repo, not this Generic repo.
