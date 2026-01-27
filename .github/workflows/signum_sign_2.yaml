@@ -34,45 +34,13 @@ jobs:
           Support issues: https://support.keyfactor.com/
           EOF
 
-      # ---------- REQUIRED: set these repo secrets ----------
+      # If you want to force authenticated pull, add these repo secrets:
       # - JFROG_USERNAME
-      # - JFROG_TOKEN (or password / access token)
+      # - JFROG_TOKEN   (API Key or password recommended)
+      # Also required for Signum itself:
       # - SIGNUM_HOSTNAME
       # - SIGNUM_USERNAME
       # - SIGNUM_PASSWORD
-      # (Make sure the secret names used below match the names in your repo settings.)
-
-      - name: Validate required secrets are present
-        id: check_secrets
-        shell: bash
-        env:
-          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
-          JFROG_TOKEN:    ${{ secrets.JFROG_TOKEN }}
-          SIGNUM_HOSTNAME: ${{ secrets.SIGNUM_HOSTNAME }}
-          SIGNUM_USERNAME: ${{ secrets.SIGNUM_USERNAME }}
-          SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
-        run: |
-          set -euo pipefail
-          missing=()
-          test -n "${JFROG_USERNAME:-}" || missing+=("JFROG_USERNAME")
-          test -n "${JFROG_TOKEN:-}" || missing+=("JFROG_TOKEN")
-          test -n "${SIGNUM_HOSTNAME:-}" || missing+=("SIGNUM_HOSTNAME")
-          test -n "${SIGNUM_USERNAME:-}" || missing+=("SIGNUM_USERNAME")
-          test -n "${SIGNUM_PASSWORD:-}" || missing+=("SIGNUM_PASSWORD")
-          if [ "${#missing[@]}" -ne 0 ]; then
-            echo "Required secrets missing: ${missing[*]}"
-            echo "Please add them under Settings → Secrets and variables → Actions"
-            exit 1
-          fi
-          echo "All required secrets present."
-
-      - name: Docker login (repo.keyfactor.com)
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.SIGNUM_REGISTRY }}
-          username: ${{ secrets.JFROG_USERNAME }}
-          password: ${{ secrets.JFROG_TOKEN }}
-          logout: true
 
       - name: Resolve agent image ref
         id: img
@@ -85,6 +53,71 @@ jobs:
           fi
           echo "image=${IMG}" >> "$GITHUB_OUTPUT"
           echo "Using agent image: ${IMG}"
+
+      - name: Try anonymous docker pull (no login)
+        id: anon_pull
+        shell: bash
+        env:
+          SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
+        run: |
+          set -euo pipefail
+          echo "=== Attempting anonymous docker pull of ${SIGNUM_AGENT_IMAGE} ==="
+          if docker pull "${SIGNUM_AGENT_IMAGE}"; then
+            echo "PULLED=anonymous" >> "$GITHUB_OUTPUT"
+            echo "Anonymous pull succeeded."
+          else
+            echo "PULLED=failed" >> "$GITHUB_OUTPUT"
+            echo "Anonymous pull failed. If this image requires authentication, provide JFROG_USERNAME and JFROG_TOKEN secrets."
+            # do not exit here — subsequent authenticated-login step may run (see conditional)
+          fi
+
+      - name: Docker login (JFrog) — only when secrets present
+        if: ${{ (secrets.JFROG_USERNAME != '') && (secrets.JFROG_TOKEN != '') && (steps.anon_pull.outputs.PULLED != 'anonymous') }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.SIGNUM_REGISTRY }}
+          username: ${{ secrets.JFROG_USERNAME }}
+          password: ${{ secrets.JFROG_TOKEN }}
+          logout: true
+
+      - name: Manual docker login fallback (password-stdin) - diagnostic
+        if: ${{ (secrets.JFROG_USERNAME != '') && (secrets.JFROG_TOKEN != '') && (steps.anon_pull.outputs.PULLED != 'anonymous') }}
+        continue-on-error: true
+        shell: bash
+        env:
+          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
+          JFROG_TOKEN:    ${{ secrets.JFROG_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "=== Diagnostic: curl v2 HEAD ==="
+          curl -sS -u "${JFROG_USERNAME}:${JFROG_TOKEN}" -I https://${{ env.SIGNUM_REGISTRY }}/v2/ || true
+          echo "=== Diagnostic: docker login (password-stdin) ==="
+          printf '%s' "${JFROG_TOKEN}" | docker login "${{ env.SIGNUM_REGISTRY }}" --username "${JFROG_USERNAME}" --password-stdin || true
+          echo "=== diagnostic done ==="
+
+      - name: Ensure image present (try authenticated pull if needed)
+        id: ensure_image
+        shell: bash
+        env:
+          SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
+          SIGNUM_REGISTRY: ${{ env.SIGNUM_REGISTRY }}
+        run: |
+          set -euo pipefail
+          # If anonymous pull succeeded earlier we don't need to pull again.
+          if [ "${{ steps.anon_pull.outputs.PULLED }}" = "anonymous" ]; then
+            echo "Image already pulled anonymously."
+            exit 0
+          fi
+
+          echo "Anonymous pull did not succeed; attempting authenticated pull (if login was run)."
+          if docker pull "${SIGNUM_AGENT_IMAGE}"; then
+            echo "Authenticated pull succeeded."
+            exit 0
+          else
+            echo "Authenticated pull failed. Cannot obtain image ${SIGNUM_AGENT_IMAGE}."
+            # fail the job here since we cannot run the container without the image
+            exit 1
+          fi
 
       - name: Run Signum Agent container and list available certs (debug)
         shell: bash
@@ -114,16 +147,13 @@ jobs:
             echo 'Write-Host "Hello from Signum signing demo"' > filestosign/example-script.ps1
           fi
 
-          echo "== Pull Signum agent image =="
-          docker pull "${SIGNUM_AGENT_IMAGE}"
-
           echo "== Run container =="
           docker rm -f signum-agent >/dev/null 2>&1 || true
 
-          # <-- The docker run you requested
           docker run --name signum-agent -d \
             -v "$PWD/filestosign:/mnt/filestosign" \
             -e "SIGNUM_HOSTNAME=${SIGNUM_HOSTNAME}" \
+            -e "SIGNUM_CLIENTID=${SIGNUM_CLIENTID:-}" \
             -e "SIGNUM_USERNAME=${SIGNUM_USERNAME}" \
             -e "SIGNUM_PASSWORD=${SIGNUM_PASSWORD}" \
             -e "SIGNUM_LOGLEVEL=HIGH" \
@@ -134,11 +164,15 @@ jobs:
           docker ps -a | sed -n '1,15p'
 
           echo "== List certs (signum-util lc) =="
-          docker exec signum-agent signum-util lc | tee signum-certs.txt
+          docker exec signum-agent signum-util lc | tee signum-certs.txt || true
 
           echo "### Signum cert listing (signum-util lc)" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat signum-certs.txt >> "$GITHUB_STEP_SUMMARY"
+          if [ -f signum-certs.txt ]; then
+            cat signum-certs.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "(no signum-certs.txt produced)" >> "$GITHUB_STEP_SUMMARY"
+          fi
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup container
