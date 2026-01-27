@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       signum_agent_image:
-        description: "Container image to use (include tag)."
+        description: "Container image to use (include tag). Avoid :latest for reliability."
         required: false
-        default: "repo.keyfactor.com/images/signum-agent:4.20.0"
+        default: "repo.keyfactor.com/images/signum-agent:4.60.2"
   push:
     branches: ["main"]
     paths:
@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SIGNUM_REGISTRY: repo.keyfactor.com
-      DEFAULT_SIGNUM_AGENT_IMAGE: repo.keyfactor.com/images/signum-agent:4.20.0
+      DEFAULT_SIGNUM_AGENT_IMAGE: repo.keyfactor.com/images/signum-agent:4.60.2
 
     steps:
       - name: Checkout
@@ -34,28 +34,51 @@ jobs:
           Support issues: https://support.keyfactor.com/
           EOF
 
-      - name: Configure Docker auth for repo.keyfactor.com
+      # ---------- REQUIRED: set these repo secrets ----------
+      # - JFROG_USERNAME
+      # - JFROG_TOKEN (or password / access token)
+      # - SIGNUM_HOSTNAME
+      # - SIGNUM_USERNAME
+      # - SIGNUM_PASSWORD
+      # (Make sure the secret names used below match the names in your repo settings.)
+
+      - name: Validate required secrets are present
+        id: check_secrets
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p ~/.docker
-          cat > ~/.docker/config.json <<EOF
-          {
-            "auths": {
-              "${SIGNUM_REGISTRY}": {
-                "auth": "${{ secrets.JFROG_DOCKER_AUTH }}"
-              }
-            }
-          }
-          EOF
+          missing=()
+          test -n "${{ secrets.JFROG_USERNAME:- }}" || missing+=("JFROG_USERNAME")
+          test -n "${{ secrets.JFROG_TOKEN:- }}" || missing+=("JFROG_TOKEN")
+          test -n "${{ secrets.SIGNUM_HOSTNAME:- }}" || missing+=("SIGNUM_HOSTNAME")
+          test -n "${{ secrets.SIGNUM_USERNAME:- }}" || missing+=("SIGNUM_USERNAME")
+          test -n "${{ secrets.SIGNUM_PASSWORD:- }}" || missing+=("SIGNUM_PASSWORD")
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "Required secrets missing: ${missing[*]}"
+            echo "Please add them under Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          echo "All required secrets present."
 
-          echo "== Docker auth configured for =="
-          python3 - <<'PY'
-          import json, os
-          with open(os.path.expanduser("~/.docker/config.json")) as f:
-              cfg=json.load(f)
-          print(list(cfg.get("auths", {}).keys()))
-          PY
+      - name: Docker login (repo.keyfactor.com)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.SIGNUM_REGISTRY }}
+          username: ${{ secrets.JFROG_USERNAME }}
+          password: ${{ secrets.JFROG_TOKEN }}
+          logout: true
+
+      - name: Resolve agent image ref
+        id: img
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="${{ inputs.signum_agent_image }}"
+          if [ -z "${IMG}" ]; then
+            IMG="${DEFAULT_SIGNUM_AGENT_IMAGE}"
+          fi
+          echo "image=${IMG}" >> "$GITHUB_OUTPUT"
+          echo "Using agent image: ${IMG}"
 
       - name: Run Signum Agent container and list available certs (debug)
         shell: bash
@@ -64,7 +87,7 @@ jobs:
           SIGNUM_CLIENTID: ${{ secrets.SIGNUM_CLIENTID }}
           SIGNUM_USERNAME: ${{ secrets.SIGNUM_USERNAME }}
           SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
-          SIGNUM_AGENT_IMAGE: ${{ inputs.signum_agent_image || env.DEFAULT_SIGNUM_AGENT_IMAGE }}
+          SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
         run: |
           set -euo pipefail
 
@@ -85,25 +108,24 @@ jobs:
             echo 'Write-Host "Hello from Signum signing demo"' > filestosign/example-script.ps1
           fi
 
-          echo "== Validate image ref (manifest) =="
-          docker manifest inspect "${SIGNUM_AGENT_IMAGE}" >/dev/null
-
           echo "== Pull Signum agent image =="
           docker pull "${SIGNUM_AGENT_IMAGE}"
 
           echo "== Run container =="
+          docker rm -f signum-agent >/dev/null 2>&1 || true
+
+          # <-- THIS is the docker run you asked to add; using secrets so creds are not exposed in logs
           docker run --name signum-agent -d \
             -v "$PWD/filestosign:/mnt/filestosign" \
-            -e "SIGNUM_HOSTNAME=$SIGNUM_HOSTNAME" \
-            -e "SIGNUM_CLIENTID=$SIGNUM_CLIENTID" \
-            -e "SIGNUM_USERNAME=$SIGNUM_USERNAME" \
-            -e "SIGNUM_PASSWORD=$SIGNUM_PASSWORD" \
+            -e "SIGNUM_HOSTNAME=${SIGNUM_HOSTNAME}" \
+            -e "SIGNUM_USERNAME=${SIGNUM_USERNAME}" \
+            -e "SIGNUM_PASSWORD=${SIGNUM_PASSWORD}" \
             -e "SIGNUM_LOGLEVEL=HIGH" \
             -e "SIGNUM_LOGTYPE=FILE" \
             "${SIGNUM_AGENT_IMAGE}"
 
           echo "== Container status =="
-          docker ps -a | sed -n '1,10p'
+          docker ps -a | sed -n '1,15p'
 
           echo "== List certs (signum-util lc) =="
           docker exec signum-agent signum-util lc | tee signum-certs.txt
