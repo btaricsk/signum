@@ -34,9 +34,32 @@ jobs:
           Support issues: https://support.keyfactor.com/
           EOF
 
-      # Create these repo secrets:
+      # ---------- REQUIRED: set these repo secrets ----------
       # - JFROG_USERNAME
       # - JFROG_TOKEN (or password / access token)
+      # - SIGNUM_HOSTNAME
+      # - SIGNUM_USERNAME
+      # - SIGNUM_PASSWORD
+      # (Make sure the secret names used below match the names in your repo settings.)
+
+      - name: Validate required secrets are present
+        id: check_secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          test -n "${{ secrets.JFROG_USERNAME:- }}" || missing+=("JFROG_USERNAME")
+          test -n "${{ secrets.JFROG_TOKEN:- }}" || missing+=("JFROG_TOKEN")
+          test -n "${{ secrets.SIGNUM_HOSTNAME:- }}" || missing+=("SIGNUM_HOSTNAME")
+          test -n "${{ secrets.SIGNUM_USERNAME:- }}" || missing+=("SIGNUM_USERNAME")
+          test -n "${{ secrets.SIGNUM_PASSWORD:- }}" || missing+=("SIGNUM_PASSWORD")
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "Required secrets missing: ${missing[*]}"
+            echo "Please add them under Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          echo "All required secrets present."
+
       - name: Docker login (repo.keyfactor.com)
         uses: docker/login-action@v3
         with:
@@ -90,12 +113,13 @@ jobs:
 
           echo "== Run container =="
           docker rm -f signum-agent >/dev/null 2>&1 || true
+
+          # <-- THIS is the docker run you asked to add; using secrets so creds are not exposed in logs
           docker run --name signum-agent -d \
             -v "$PWD/filestosign:/mnt/filestosign" \
-            -e "SIGNUM_HOSTNAME=$SIGNUM_HOSTNAME" \
-            -e "SIGNUM_CLIENTID=$SIGNUM_CLIENTID" \
-            -e "SIGNUM_USERNAME=$SIGNUM_USERNAME" \
-            -e "SIGNUM_PASSWORD=$SIGNUM_PASSWORD" \
+            -e "SIGNUM_HOSTNAME=${SIGNUM_HOSTNAME}" \
+            -e "SIGNUM_USERNAME=${SIGNUM_USERNAME}" \
+            -e "SIGNUM_PASSWORD=${SIGNUM_PASSWORD}" \
             -e "SIGNUM_LOGLEVEL=HIGH" \
             -e "SIGNUM_LOGTYPE=FILE" \
             "${SIGNUM_AGENT_IMAGE}"
