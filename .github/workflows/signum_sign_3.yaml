@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       signum_agent_image:
-        description: "Container image to use (include tag). Avoid :latest for reliability."
+        description: "Full image ref to pull/run (include tag)."
         required: false
-        default: "repo.keyfactor.com/images/signum-agent:4.60.2"
+        default: "keyfactor.jfrog.io/signum-bdewberry-testing-docker/signum-agent:4.60.2"
   push:
     branches: ["main"]
     paths:
@@ -19,8 +19,8 @@ jobs:
   sign:
     runs-on: ubuntu-latest
     env:
-      SIGNUM_REGISTRY: repo.keyfactor.com
-      DEFAULT_SIGNUM_AGENT_IMAGE: repo.keyfactor.com/images/signum-agent:4.60.2
+      SIGNUM_REGISTRY: keyfactor.jfrog.io
+      DEFAULT_SIGNUM_AGENT_IMAGE: keyfactor.jfrog.io/signum-bdewberry-testing-docker/signum-agent:4.60.2
 
     steps:
       - name: Checkout
@@ -62,11 +62,12 @@ jobs:
             echo "Anonymous pull failed."
           fi
 
-      - name: Detect presence of repo.keyfactor.com credentials
+      - name: Detect presence of JFrog credentials
         id: detect_creds
         shell: bash
         env:
           JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
+          # Put your JFrog API Key (recommended) or password in this secret:
           JFROG_TOKEN:    ${{ secrets.JFROG_TOKEN }}
         run: |
           set -euo pipefail
@@ -77,7 +78,7 @@ jobs:
           echo "creds_present=${creds_present}" >> "$GITHUB_OUTPUT"
           echo "Detected creds_present=${creds_present}"
 
-      - name: Docker login (repo.keyfactor.com) — only if creds exist and anon pull failed
+      - name: Docker login (keyfactor.jfrog.io) — only if creds exist and anon pull failed
         if: ${{ steps.detect_creds.outputs.creds_present == 'true' && steps.anon_pull.outputs.pulled != 'anonymous' }}
         uses: docker/login-action@v3
         with:
