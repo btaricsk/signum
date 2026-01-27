@@ -11,24 +11,22 @@ permissions:
   contents: read
 
 jobs:
-  sign:
+  download:
     runs-on: ubuntu-latest
     env:
-      JFROG_BASE_URL: https://keyfactor.jfrog.io/artifactory
+      # Used for the actual file download URLs:
+      JFROG_DOWNLOAD_BASE: https://keyfactor.jfrog.io/artifactory
+
+      # Candidate bases for the Storage API (one of these usually works):
+      JFROG_API_BASE_1: https://keyfactor.jfrog.io/artifactory
+      JFROG_API_BASE_2: https://keyfactor.jfrog.io
+
       JFROG_REPO: signum-bdewberry-testing
       AGENT_PARENT_PATH: keyfactor/signum-linux-agent
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Notes / Support Disclaimer
-        shell: bash
-        run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
-          ## Signum Agent – Support / Usage Notes
-          Support issues: https://support.keyfactor.com/
-          EOF
 
       - name: Validate JFrog credentials present
         shell: bash
@@ -41,22 +39,23 @@ jobs:
             echo "Missing secrets. Add JFROG_USERNAME and JFROG_TOKEN."
             exit 1
           fi
-          echo "JFrog credentials present."
 
-      - name: Download latest Signum linux agent (resolve real file via storage API)
+      - name: Resolve latest file via storage API + download
         shell: bash
         env:
           JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
           JFROG_TOKEN: ${{ secrets.JFROG_TOKEN }}
         run: |
           set -euo pipefail
-
           mkdir -p signum-agent-download
 
-          FILE_PATH="$(python3 - <<'PY'
+          FILE_PATH_AND_API="$(python3 - <<'PY'
           import base64, json, os, sys, urllib.request, urllib.error
 
-          base = os.environ["JFROG_BASE_URL"].rstrip("/")
+          api_bases = [
+            os.environ["JFROG_API_BASE_1"].rstrip("/"),
+            os.environ["JFROG_API_BASE_2"].rstrip("/"),
+          ]
           repo = os.environ["JFROG_REPO"]
           parent = os.environ["AGENT_PARENT_PATH"].strip("/")
           user = os.environ["JFROG_USERNAME"]
@@ -70,15 +69,34 @@ jobs:
             with urllib.request.urlopen(req) as resp:
               return json.loads(resp.read().decode())
 
-          def children(path: str):
-            url = f"{base}/api/storage/{repo}/{path}"
+          def children(api_base: str, path: str):
+            url = f"{api_base}/api/storage/{repo}/{path}"
             j = get_json(url)
             return [c["uri"].lstrip("/") for c in j.get("children", [])]
 
           def looks_like_file(name: str) -> bool:
             return "." in name.split("/")[-1]
 
-          kids = children(parent)
+          # Find a working API base by listing the parent path
+          working_base = None
+          kids = None
+          for b in api_bases:
+            try:
+              k = children(b, parent)
+              working_base = b
+              kids = k
+              break
+            except urllib.error.HTTPError as e:
+              # keep trying other base
+              continue
+
+          if working_base is None or kids is None:
+            print("ERROR: Could not access storage API at either base for the given repo/path.", file=sys.stderr)
+            print(f"Tried bases: {api_bases}", file=sys.stderr)
+            print(f"Repo: {repo}", file=sys.stderr)
+            print(f"Path: {parent}", file=sys.stderr)
+            sys.exit(1)
+
           if not kids:
             print(f"No children under {parent}", file=sys.stderr)
             sys.exit(1)
@@ -87,29 +105,31 @@ jobs:
 
           def resolve_to_file(path: str) -> str:
             try:
-              kids2 = children(path)
+              k2 = children(working_base, path)
             except urllib.error.HTTPError:
               return path
-
-            if kids2:
-              files = [k for k in kids2 if looks_like_file(k)]
+            if k2:
+              files = [k for k in k2 if looks_like_file(k)]
               if files:
                 return path.rstrip("/") + "/" + sorted(files)[0]
-              return resolve_to_file(path.rstrip("/") + "/" + sorted(kids2)[0])
+              return resolve_to_file(path.rstrip("/") + "/" + sorted(k2)[0])
             return path
 
-          print(resolve_to_file(chosen))
+          file_path = resolve_to_file(chosen)
+          print(f"{working_base}|{file_path}")
           PY
           )"
 
+          API_BASE="${FILE_PATH_AND_API%%|*}"
+          FILE_PATH="${FILE_PATH_AND_API#*|}"
+
+          echo "Using storage API base: ${API_BASE}"
           echo "Resolved file path: ${FILE_PATH}"
 
-          FILE_URL="${JFROG_BASE_URL}/${JFROG_REPO}/${FILE_PATH}"
+          FILE_URL="${JFROG_DOWNLOAD_BASE}/${JFROG_REPO}/${FILE_PATH}"
           OUT="signum-agent-download/$(basename "${FILE_PATH}")"
 
-          echo "Downloading from:"
-          echo "${FILE_URL}"
-
+          echo "Downloading from: ${FILE_URL}"
           curl -fLsS -u "${JFROG_USERNAME}:${JFROG_TOKEN}" -o "${OUT}" "${FILE_URL}"
 
           echo "== Downloaded file info =="
@@ -125,6 +145,7 @@ jobs:
           echo "### Downloaded Signum agent artifact" >> "$GITHUB_STEP_SUMMARY"
           echo "- Source: ${FILE_URL}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Output: ${OUT}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Storage API base used: ${API_BASE}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload downloaded artifact
         if: always()
