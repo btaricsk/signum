@@ -34,14 +34,6 @@ jobs:
           Support issues: https://support.keyfactor.com/
           EOF
 
-      # If you want to force authenticated pull, add these repo secrets:
-      # - JFROG_USERNAME
-      # - JFROG_TOKEN   (API Key or password recommended)
-      # Also required for Signum itself:
-      # - SIGNUM_HOSTNAME
-      # - SIGNUM_USERNAME
-      # - SIGNUM_PASSWORD
-
       - name: Resolve agent image ref
         id: img
         shell: bash
@@ -67,12 +59,27 @@ jobs:
             echo "Anonymous pull succeeded."
           else
             echo "PULLED=failed" >> "$GITHUB_OUTPUT"
-            echo "Anonymous pull failed. If this image requires authentication, provide JFROG_USERNAME and JFROG_TOKEN secrets."
-            # do not exit here — subsequent authenticated-login step may run (see conditional)
+            echo "Anonymous pull failed."
           fi
 
-      - name: Docker login (JFrog) — only when secrets present
-        if: ${{ (secrets.JFROG_USERNAME != '') && (secrets.JFROG_TOKEN != '') && (steps.anon_pull.outputs.PULLED != 'anonymous') }}
+      - name: Detect presence of JFrog credentials (set output)
+        id: detect_creds
+        shell: bash
+        env:
+          # map secrets into env so we can check them in shell (no secrets.* in if expressions)
+          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
+          JFROG_TOKEN:    ${{ secrets.JFROG_TOKEN }}
+        run: |
+          set -euo pipefail
+          creds_present="false"
+          if [ -n "${JFROG_USERNAME:-}" ] && [ -n "${JFROG_TOKEN:-}" ]; then
+            creds_present="true"
+          fi
+          echo "creds_present=${creds_present}" >> "$GITHUB_OUTPUT"
+          echo "Detected creds_present=${creds_present}"
+
+      - name: Docker login (repo.keyfactor.com)
+        if: ${{ steps.detect_creds.outputs.creds_present == 'true' && steps.anon_pull.outputs.PULLED != 'anonymous' }}
         uses: docker/login-action@v3
         with:
           registry: ${{ env.SIGNUM_REGISTRY }}
@@ -81,12 +88,13 @@ jobs:
           logout: true
 
       - name: Manual docker login fallback (password-stdin) - diagnostic
-        if: ${{ (secrets.JFROG_USERNAME != '') && (secrets.JFROG_TOKEN != '') && (steps.anon_pull.outputs.PULLED != 'anonymous') }}
+        if: ${{ steps.detect_creds.outputs.creds_present == 'true' && steps.anon_pull.outputs.PULLED != 'anonymous' }}
         continue-on-error: true
         shell: bash
         env:
           JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
           JFROG_TOKEN:    ${{ secrets.JFROG_TOKEN }}
+          SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
         run: |
           set -euo pipefail
           echo "=== Diagnostic: curl v2 HEAD ==="
@@ -100,7 +108,6 @@ jobs:
         shell: bash
         env:
           SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
-          SIGNUM_REGISTRY: ${{ env.SIGNUM_REGISTRY }}
         run: |
           set -euo pipefail
           # If anonymous pull succeeded earlier we don't need to pull again.
@@ -115,7 +122,6 @@ jobs:
             exit 0
           else
             echo "Authenticated pull failed. Cannot obtain image ${SIGNUM_AGENT_IMAGE}."
-            # fail the job here since we cannot run the container without the image
             exit 1
           fi
 
