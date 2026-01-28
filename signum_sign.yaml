@@ -6,11 +6,7 @@ on:
       signum_agent_image:
         description: "Container image to use (include tag)."
         required: false
-        default: "repo.keyfactor.com/images/signum-agent:4.60.3"
-      signum_agent_image_tar_gz:
-        description: "Optional: URL (or repo-relative path) to a docker-archive .tar.gz created by `docker save | gzip`."
-        required: false
-        default: ""
+        default: "repo.keyfactor.com/signum-cache/signum-agent:4.60.2"
   push:
     branches: ["main"]
     paths:
@@ -24,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SIGNUM_REGISTRY: repo.keyfactor.com
-      DEFAULT_SIGNUM_AGENT_IMAGE: repo.keyfactor.com/images/signum-agent:4.60.3
+      DEFAULT_SIGNUM_AGENT_IMAGE: repo.keyfactor.com/signum-cache/signum-agent:4.60.2
 
     steps:
       - name: Checkout
@@ -38,35 +34,33 @@ jobs:
           Support issues: https://support.keyfactor.com/
           EOF
 
-      - name: Configure Docker auth for repo.keyfactor.com (only needed if we pull)
+      - name: Docker login to repo.keyfactor.com (decode JFROG_DOCKER_AUTH)
         shell: bash
         env:
           JFROG_DOCKER_AUTH: ${{ secrets.JFROG_DOCKER_AUTH }}
         run: |
           set -euo pipefail
+
           if [[ -z "${JFROG_DOCKER_AUTH:-}" ]]; then
-            echo "JFROG_DOCKER_AUTH not set; will still work if we load locally and never pull."
-            exit 0
+            echo "ERROR: secrets.JFROG_DOCKER_AUTH is empty/missing."
+            exit 1
           fi
 
-          mkdir -p ~/.docker
-          cat > ~/.docker/config.json <<EOF
-          {
-            "auths": {
-              "${SIGNUM_REGISTRY}": {
-                "auth": "${JFROG_DOCKER_AUTH}"
-              }
-            }
-          }
-          EOF
+          # JFROG_DOCKER_AUTH is expected to be base64("username:password")
+          CREDS="$(echo "${JFROG_DOCKER_AUTH}" | base64 -d || true)"
+          if [[ -z "${CREDS}" || "${CREDS}" != *:* ]]; then
+            echo "ERROR: secrets.JFROG_DOCKER_AUTH did not decode to 'username:password'."
+            exit 1
+          fi
 
-          echo "== Docker auth configured for =="
-          python3 - <<'PY'
-          import json, os
-          with open(os.path.expanduser("~/.docker/config.json")) as f:
-              cfg=json.load(f)
-          print(list(cfg.get("auths", {}).keys()))
-          PY
+          USERNAME="${CREDS%%:*}"
+          PASSWORD="${CREDS#*:}"
+
+          echo "${PASSWORD}" | docker login "${SIGNUM_REGISTRY}" -u "${USERNAME}" --password-stdin
+
+          echo "== Registry /v2/ probe (helps distinguish auth vs missing repo) =="
+          # 200 or 401/403 usually means registry reachable; 404 sometimes means wrong endpoint/proxy.
+          curl -sS -o /dev/null -w "GET https://${SIGNUM_REGISTRY}/v2/ => HTTP %{http_code}\n" "https://${SIGNUM_REGISTRY}/v2/" || true
 
       - name: Run Signum Agent container and list available certs (debug)
         shell: bash
@@ -75,9 +69,7 @@ jobs:
           SIGNUM_CLIENTID: ${{ secrets.SIGNUM_CLIENTID }}
           SIGNUM_USERNAME: ${{ secrets.SIGNUM_USERNAME }}
           SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
-
           SIGNUM_AGENT_IMAGE: ${{ inputs.signum_agent_image || env.DEFAULT_SIGNUM_AGENT_IMAGE }}
-          SIGNUM_AGENT_IMAGE_TAR_GZ: ${{ inputs.signum_agent_image_tar_gz }}
         run: |
           set -euo pipefail
 
@@ -98,43 +90,16 @@ jobs:
             echo 'Write-Host "Hello from Signum signing demo"' > filestosign/example-script.ps1
           fi
 
-          echo "== Attempt local import first (optional) =="
-          if [[ -n "${SIGNUM_AGENT_IMAGE_TAR_GZ:-}" ]]; then
-            echo "Tarball source provided: ${SIGNUM_AGENT_IMAGE_TAR_GZ}"
-            TARBALL="signum-agent-image.tar.gz"
-
-            if [[ "${SIGNUM_AGENT_IMAGE_TAR_GZ}" =~ ^https?:// ]]; then
-              echo "Downloading tarball from URL..."
-              curl -fsSL "${SIGNUM_AGENT_IMAGE_TAR_GZ}" -o "${TARBALL}"
-            else
-              echo "Using repo-relative tarball path..."
-              [[ -f "${SIGNUM_AGENT_IMAGE_TAR_GZ}" ]] || { echo "ERROR: Not found: ${SIGNUM_AGENT_IMAGE_TAR_GZ}"; exit 1; }
-              cp "${SIGNUM_AGENT_IMAGE_TAR_GZ}" "${TARBALL}"
-            fi
-
-            echo "Loading image into local Docker daemon..."
-            gzip -dc "${TARBALL}" | docker load
-
-            echo "Images after load:"
-            docker image ls | sed -n '1,20p'
-
-            if ! docker image inspect "${SIGNUM_AGENT_IMAGE}" >/dev/null 2>&1; then
-              echo "Desired tag not present after load."
-              echo "If your tarball contains a different tag, you must retag it to: ${SIGNUM_AGENT_IMAGE}"
-              echo "Available tags for signum-agent after load:"
-              docker image ls | grep -i signum || true
-              exit 1
-            fi
-          else
-            echo "No tarball provided; skipping docker load."
-          fi
-
-          echo "== Ensure image exists (pull only if needed) =="
-          if docker image inspect "${SIGNUM_AGENT_IMAGE}" >/dev/null 2>&1; then
-            echo "Using local image: ${SIGNUM_AGENT_IMAGE}"
-          else
-            echo "Local image not found. Pulling from registry..."
-            docker pull "${SIGNUM_AGENT_IMAGE}"
+          echo "== Pull Signum agent image =="
+          # On GitHub-hosted runners it will never be local, so just pull.
+          # If it fails, dump a bit of diagnostics.
+          if ! docker pull "${SIGNUM_AGENT_IMAGE}"; then
+            echo "ERROR: docker pull failed for ${SIGNUM_AGENT_IMAGE}"
+            echo "== Diagnostics =="
+            echo "Registry: ${SIGNUM_REGISTRY}"
+            echo "Try confirming the repo/tag exists and that the registry endpoint is correct."
+            echo "You can also try pulling a known-good image from the same registry/repo to validate auth."
+            exit 1
           fi
 
           echo "== Run container =="
