@@ -1,4 +1,4 @@
-name: Sign document with Signum Container Agent (pkcs11)
+name: Signum PKCS11 cert discovery (by thumbprint)
 
 on:
   workflow_dispatch:
@@ -11,11 +11,12 @@ permissions:
   contents: read
 
 jobs:
-  discover-cert:
+  pkcs11-discovery:
     runs-on: ubuntu-latest
     env:
+      SIGNUM_REGISTRY: keyfactor.jfrog.io
       SIGNUM_AGENT_IMAGE: keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1
-      # Target cert identity
+
       TARGET_SERIAL: "2500008C4781F03B6AB4CED422000000008C47"
       TARGET_THUMBPRINT: "1405C03B01A76072AC8E6D676957AE42B368289A"
 
@@ -26,7 +27,7 @@ jobs:
       - name: Docker login (keyfactor.jfrog.io)
         uses: docker/login-action@v3
         with:
-          registry: keyfactor.jfrog.io
+          registry: ${{ env.SIGNUM_REGISTRY }}
           username: ${{ secrets.JFROG_USERNAME }}
           password: ${{ secrets.JFROG_TOKEN }}
           logout: true
@@ -40,7 +41,7 @@ jobs:
             echo 'Write-Host "Hello from Signum signing demo"' > filestosign/example-script.ps1
           fi
 
-      - name: Run Signum Agent container
+      - name: Start Signum Agent container
         shell: bash
         env:
           SIGNUM_HOSTNAME: ${{ secrets.SIGNUM_HOSTNAME }}
@@ -59,99 +60,107 @@ jobs:
             -e "SIGNUM_LOGLEVEL=HIGH" \
             -e "SIGNUM_LOGTYPE=FILE" \
             "${SIGNUM_AGENT_IMAGE}"
-          docker ps -a | sed -n '1,10p'
+          docker ps -a | sed -n '1,15p'
+          docker logs signum-agent | tail -n 80 | tee signum-agent-startup.log || true
 
-      - name: Install OpenSC tools (pkcs11-tool)
+      - name: Install tools (OpenSC + OpenSSL)
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y opensc
+          sudo apt-get install -y opensc openssl
 
-      - name: Locate PKCS11 module in container (best effort)
+      - name: Materialize Signum PKCS11 module
         shell: bash
+        env:
+          SIGNUM_PKCS11_MODULE_B64: ${{ secrets.SIGNUM_PKCS11_MODULE_B64 }}
         run: |
           set -euo pipefail
-          # The image log suggests OpenSC exists at /opt/opensc/bin. The PKCS11 module is usually a .so.
-          # We'll search for likely pkcs11 modules inside the container and copy them out.
-          docker exec signum-agent sh -lc 'find / -maxdepth 6 -type f \( -name "*pkcs11*.so" -o -name "opensc-pkcs11.so" \) 2>/dev/null | sed -n "1,200p"' | tee pkcs11-modules.txt
-          MOD="$(head -n 1 pkcs11-modules.txt || true)"
-          if [ -z "$MOD" ]; then
-            echo "No pkcs11 module found in container via search. You likely need the Signum PKCS11 driver installed on runner."
+          if [ -z "${SIGNUM_PKCS11_MODULE_B64:-}" ]; then
+            echo "Missing secret SIGNUM_PKCS11_MODULE_B64 (base64 of the PKCS11 .so)."
             exit 1
           fi
-          echo "Using module: $MOD"
-          docker cp "signum-agent:$MOD" ./signum-pkcs11.so
-          ls -la ./signum-pkcs11.so
 
-      - name: Enumerate tokens and certificates (PKCS11)
+          mkdir -p pkcs11
+          echo "$SIGNUM_PKCS11_MODULE_B64" | base64 -d > pkcs11/signum-pkcs11.so
+          chmod 755 pkcs11/signum-pkcs11.so
+          file pkcs11/signum-pkcs11.so | tee pkcs11-module-file.txt
+          ls -la pkcs11/signum-pkcs11.so
+
+      - name: PKCS11 list slots and cert objects
         shell: bash
+        env:
+          SIGNUM_PKCS11_PIN: ${{ secrets.SIGNUM_PKCS11_PIN }}
         run: |
           set -euo pipefail
-          MODULE="$PWD/signum-pkcs11.so"
+          MODULE="$PWD/pkcs11/signum-pkcs11.so"
 
           echo "== pkcs11-tool --list-slots =="
           pkcs11-tool --module "$MODULE" --list-slots | tee pkcs11-slots.txt
 
-          echo "== pkcs11-tool --list-objects (certs) =="
-          # We don't pass PIN here yet. Some modules allow cert listing without it.
+          echo "== pkcs11-tool --list-objects (certs, no login) =="
           pkcs11-tool --module "$MODULE" --list-objects --type cert 2>&1 | tee pkcs11-certs.txt || true
 
-          echo "== Try with PIN if required =="
-          if grep -qiE 'PIN|CKR_PIN|login' pkcs11-certs.txt; then
-            pkcs11-tool --module "$MODULE" --login --pin "${{ secrets.SIGNUM_PKCS11_PIN }}" --list-objects --type cert 2>&1 | tee pkcs11-certs-with-pin.txt
+          echo "== pkcs11-tool --list-objects (certs, with login if PIN provided) =="
+          if [ -n "${SIGNUM_PKCS11_PIN:-}" ]; then
+            pkcs11-tool --module "$MODULE" --login --pin "$SIGNUM_PKCS11_PIN" --list-objects --type cert 2>&1 | tee pkcs11-certs-with-pin.txt || true
+          else
+            echo "No SIGNUM_PKCS11_PIN provided; skipping login listing." | tee pkcs11-certs-with-pin.txt
           fi
 
-      - name: Find target cert by serial or thumbprint
+      - name: Export certs and match thumbprint
         shell: bash
+        env:
+          SIGNUM_PKCS11_PIN: ${{ secrets.SIGNUM_PKCS11_PIN }}
         run: |
           set -euo pipefail
+          MODULE="$PWD/pkcs11/signum-pkcs11.so"
 
-          # Combine outputs
           cat pkcs11-certs.txt pkcs11-certs-with-pin.txt 2>/dev/null > pkcs11-certs-all.txt || true
 
-          # Try to match serial directly
-          if grep -q "${TARGET_SERIAL}" pkcs11-certs-all.txt; then
-            echo "Found serial in PKCS11 output."
-          else
-            echo "Did not see the serial in raw listing output. Next step will be to extract cert(s) and compute fingerprints."
-          fi
+          echo "== Extract candidate IDs from pkcs11 output =="
+          # pkcs11-tool often prints "ID: <hex>" under objects.
+          IDS="$(awk '/^[[:space:]]*ID:/{print $2}' pkcs11-certs-all.txt | sort -u | tr -d '\r')"
+          echo "$IDS" | tee pkcs11-object-ids.txt
 
-          # Export all cert objects and compute SHA1 thumbprints (most Authenticode thumbprints are SHA1)
-          mkdir -p exported-certs
-          idx=0
-          # Extract object IDs from pkcs11-tool output if present (commonly "ID: xx" lines)
-          IDS=$(awk '/^  ID:/{print $2}' pkcs11-certs-all.txt | sort -u)
-          if [ -z "$IDS" ]; then
-            echo "No object IDs detected in output; cannot auto-export certs. See pkcs11-certs-all.txt for format."
+          if [ -z "${IDS}" ]; then
+            echo "No object IDs found in pkcs11 listing output. The module may hide IDs or requires different flags."
+            echo "Inspect pkcs11-certs-all.txt artifact."
             exit 1
           fi
 
+          mkdir -p exported-certs
+          i=0
           for id in $IDS; do
-            idx=$((idx+1))
-            out="exported-certs/cert-${idx}.der"
-            echo "Exporting cert with id=$id -> $out"
-            pkcs11-tool --module "$PWD/signum-pkcs11.so" --read-object --type cert --id "$id" --output-file "$out" 2>/dev/null || true
+            i=$((i+1))
+            out="exported-certs/cert-${i}.der"
+            echo "Exporting cert id=$id -> $out"
+            if [ -n "${SIGNUM_PKCS11_PIN:-}" ]; then
+              pkcs11-tool --module "$MODULE" --login --pin "$SIGNUM_PKCS11_PIN" \
+                --read-object --type cert --id "$id" --output-file "$out" 2>/dev/null || true
+            else
+              pkcs11-tool --module "$MODULE" \
+                --read-object --type cert --id "$id" --output-file "$out" 2>/dev/null || true
+            fi
           done
 
-          echo "== Compute thumbprints =="
+          echo "== Compute serial and SHA1 thumbprints for exported certs =="
           : > cert-matches.txt
           for f in exported-certs/*.der; do
-            [ -f "$f" ] || continue
-            sha1="$(openssl x509 -inform der -in "$f" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d :)"
+            [ -s "$f" ] || continue
             serial="$(openssl x509 -inform der -in "$f" -noout -serial | cut -d= -f2 | tr '[:lower:]' '[:upper:]')"
-            echo "$f serial=$serial thumbprint=$sha1" | tee -a cert-matches.txt
+            thumb="$(openssl x509 -inform der -in "$f" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d : | tr '[:lower:]' '[:upper:]')"
+            echo "$f serial=$serial thumbprint=$thumb" | tee -a cert-matches.txt
           done
 
           echo "== Select target cert =="
-          match_line="$(grep -i "${TARGET_THUMBPRINT}" cert-matches.txt | head -n 1 || true)"
-          if [ -z "$match_line" ]; then
-            echo "Target thumbprint not found in exported certs."
+          grep -i "${TARGET_THUMBPRINT}" cert-matches.txt | head -n 1 | tee selected-cert.txt
+          if [ ! -s selected-cert.txt ]; then
+            echo "Target thumbprint not found. Check cert-matches.txt."
             exit 1
           fi
 
-          echo "$match_line" | tee selected-cert.txt
-          echo "### Selected cert" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Selected certificate" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           cat selected-cert.txt >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -162,18 +171,21 @@ jobs:
         run: |
           docker rm -f signum-agent >/dev/null 2>&1 || true
 
-      - name: Upload discovery output
+      - name: Upload outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: signum-pkcs11-discovery
           path: |
-            pkcs11-modules.txt
+            pkcs11-module-file.txt
+            pkcs11/signum-pkcs11.so
             pkcs11-slots.txt
             pkcs11-certs.txt
             pkcs11-certs-with-pin.txt
             pkcs11-certs-all.txt
+            pkcs11-object-ids.txt
             exported-certs/
             cert-matches.txt
             selected-cert.txt
+            signum-agent-startup.log
             filestosign/example-script.ps1
