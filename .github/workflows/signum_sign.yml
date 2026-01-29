@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       signum_agent_image:
-        description: "Container image to use (include tag)."
+        description: "Container image to use include tag"
         required: false
         default: "keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1"
   push:
@@ -12,6 +12,7 @@ on:
     paths:
       - "filestosign/**"
       - "pkcs11/**"
+      - ".github/workflows/**"
 
 permissions:
   contents: read
@@ -23,21 +24,20 @@ jobs:
       SIGNUM_REGISTRY: keyfactor.jfrog.io
       DEFAULT_SIGNUM_AGENT_IMAGE: keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1
       PKCS11_REPO_MODULE: pkcs11/signum-pkcs11.so
+      PKCS11_WORK_MODULE: pkcs11-work/signum-pkcs11.so
       PKCS11_MOUNT_PATH: /pkcs11/signum-pkcs11.so
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Notes / Support Disclaimer
+      - name: Notes Support Disclaimer
         shell: bash
         run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
-          ## Signum Container Agent – Support / Usage Notes
-          Support issues: https://support.keyfactor.com/
-          EOF
+          echo "## Signum Container Agent Support Usage Notes" >> "$GITHUB_STEP_SUMMARY"
+          echo "Support issues https://support.keyfactor.com/" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Docker login (keyfactor.jfrog.io)
+      - name: Docker login keyfactor jfrog io
         uses: docker/login-action@v3
         with:
           registry: ${{ env.SIGNUM_REGISTRY }}
@@ -55,9 +55,9 @@ jobs:
             IMG="${DEFAULT_SIGNUM_AGENT_IMAGE}"
           fi
           echo "image=${IMG}" >> "$GITHUB_OUTPUT"
-          echo "Using agent image: ${IMG}"
+          echo "Using agent image ${IMG}"
 
-      - name: Run Signum Agent container and attempt cert discovery via API and PKCS11 slots
+      - name: Run Signum Agent container and PKCS11 slot listing
         shell: bash
         env:
           SIGNUM_HOSTNAME: ${{ secrets.SIGNUM_HOSTNAME }}
@@ -66,29 +66,30 @@ jobs:
           SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
           SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
           SIGNUM_PKCS11_PIN: ${{ secrets.SIGNUM_PKCS11_PIN }}
+          SIGNUM_PKCS11_MODULE_B64: ${{ secrets.SIGNUM_PKCS11_MODULE_B64 }}
         run: |
           set -euo pipefail
 
-          echo "== Basic checks =="
-          echo "Runner: $(uname -a)"
-          echo "Docker: $(docker --version)"
-          echo "SIGNUM_HOSTNAME set? $([[ -n "${SIGNUM_HOSTNAME:-}" ]] && echo yes || echo no)"
-          echo "SIGNUM_CLIENTID set? $([[ -n "${SIGNUM_CLIENTID:-}" ]] && echo yes || echo no)"
-          echo "SIGNUM_USERNAME set? $([[ -n "${SIGNUM_USERNAME:-}" ]] && echo yes || echo no)"
-          echo "SIGNUM_PASSWORD set? $([[ -n "${SIGNUM_PASSWORD:-}" ]] && echo yes || echo no)"
-          echo "== Image ref we will use (pull+run) =="
-          echo "${SIGNUM_AGENT_IMAGE}"
+          echo "== Basic checks ==" | tee basic-checks.txt
+          echo "Runner: $(uname -a)" | tee -a basic-checks.txt
+          echo "Docker: $(docker --version)" | tee -a basic-checks.txt
+          echo "SIGNUM_HOSTNAME set? $([[ -n "${SIGNUM_HOSTNAME:-}" ]] && echo yes || echo no)" | tee -a basic-checks.txt
+          echo "SIGNUM_CLIENTID set? $([[ -n "${SIGNUM_CLIENTID:-}" ]] && echo yes || echo no)" | tee -a basic-checks.txt
+          echo "SIGNUM_USERNAME set? $([[ -n "${SIGNUM_USERNAME:-}" ]] && echo yes || echo no)" | tee -a basic-checks.txt
+          echo "SIGNUM_PASSWORD set? $([[ -n "${SIGNUM_PASSWORD:-}" ]] && echo yes || echo no)" | tee -a basic-checks.txt
+          echo "Image: ${SIGNUM_AGENT_IMAGE}" | tee -a basic-checks.txt
 
-          echo "== Ensure there is something to sign =="
+          echo "== Ensure there is something to sign ==" | tee ensure-file.txt
           mkdir -p filestosign
           if [ ! -f "filestosign/example-script.ps1" ]; then
-            echo 'Write-Host "Hello from Signum signing demo"' > filestosign/example-script.ps1
+            printf '%s\n' 'Write-Host "Hello from Signum signing demo"' > filestosign/example-script.ps1
           fi
+          ls -la filestosign/example-script.ps1 | tee -a ensure-file.txt
 
-          echo "== Pull Signum agent image =="
-          docker pull "${SIGNUM_AGENT_IMAGE}"
+          echo "== Pull Signum agent image ==" | tee docker-pull.txt
+          docker pull "${SIGNUM_AGENT_IMAGE}" 2>&1 | tee -a docker-pull.txt
 
-          echo "== Run container (publish common API ports) =="
+          echo "== Run container ==" | tee docker-run.txt
           docker rm -f signum-agent >/dev/null 2>&1 || true
           docker run --name signum-agent -d \
             -p 8080:8080 \
@@ -101,64 +102,76 @@ jobs:
             -e "SIGNUM_PASSWORD=$SIGNUM_PASSWORD" \
             -e "SIGNUM_LOGLEVEL=HIGH" \
             -e "SIGNUM_LOGTYPE=FILE" \
-            "${SIGNUM_AGENT_IMAGE}"
+            "${SIGNUM_AGENT_IMAGE}" | tee -a docker-run.txt
 
-          echo "== Container status =="
-          docker ps -a | sed -n '1,20p'
+          docker ps -a | sed -n '1,25p' | tee signum-container-status.txt
           docker port signum-agent | tee signum-container-ports.txt || true
 
-          echo "== Wait briefly for service startup =="
+          echo "== Wait briefly for service startup ==" | tee startup-wait.txt
           sleep 3
 
-          echo "== Probe agent HTTP endpoints (best effort) =="
+          echo "== Probe agent HTTP endpoints best effort ==" | tee signum-api-probe.txt
           : > signum-api-probe.txt
           for port in 8080 5000 7000; do
             for path in /swagger /swagger/index.html /health /healthz /api/health /api/status /; do
               url="http://127.0.0.1:${port}${path}"
-              code="$(curl -s -o /dev/null -w '%{http_code}' "$url" || true)"
-              echo "${code} ${url}" | tee -a signum-api-probe.txt
+              code="$(curl -s -o /dev/null -w '%{http_code}' "${url}" || true)"
+              printf '%s\n' "${code} ${url}" | tee -a signum-api-probe.txt
             done
           done
 
-          echo "== Attempt cert listing via likely API routes (best effort) =="
+          echo "== Attempt cert listing via likely API routes best effort ==" | tee signum-certs.txt
           : > signum-certs.txt
           set +e
           for port in 8080 5000 7000; do
-            for path in \
-              /api/certificates \
-              /api/certs \
-              /api/v1/certificates \
-              /api/v1/certs \
-              /certificates \
-              /certs \
-              /swagger/v1/swagger.json
-            do
+            for path in /api/certificates /api/certs /api/v1/certificates /api/v1/certs /certificates /certs /swagger/v1/swagger.json; do
               url="http://127.0.0.1:${port}${path}"
-              echo "== GET ${url} ==" | tee -a signum-certs.txt
-              curl -sS "$url" | head -c 20000 | tee -a signum-certs.txt
-              echo "" >> signum-certs.txt
+              printf '%s\n' "== GET ${url} ==" | tee -a signum-certs.txt
+              curl -sS "${url}" | head -c 20000 | tee -a signum-certs.txt
+              printf '\n' | tee -a signum-certs.txt
             done
           done
           set -e
 
-          echo "== PKCS11 slot listing using OpenSC helper container =="
+          echo "== Prepare PKCS11 module ==" | tee pkcs11-module-prep.txt
+          mkdir -p pkcs11-work
+
+          MODULE_ON_DISK=""
+
+          if [ -f "${PKCS11_REPO_MODULE}" ]; then
+            MODULE_ON_DISK="${PKCS11_REPO_MODULE}"
+            echo "Using PKCS11 module from repo ${PKCS11_REPO_MODULE}" | tee -a pkcs11-module-prep.txt
+          elif [ -n "${SIGNUM_PKCS11_MODULE_B64:-}" ]; then
+            echo "Using PKCS11 module from secret SIGNUM_PKCS11_MODULE_B64" | tee -a pkcs11-module-prep.txt
+            printf '%s' "${SIGNUM_PKCS11_MODULE_B64}" | base64 -d > "${PKCS11_WORK_MODULE}"
+            chmod 755 "${PKCS11_WORK_MODULE}" || true
+            MODULE_ON_DISK="${PKCS11_WORK_MODULE}"
+          else
+            echo "No PKCS11 module available. Provide pkcs11/signum-pkcs11.so in repo or secret SIGNUM_PKCS11_MODULE_B64" | tee -a pkcs11-module-prep.txt
+          fi
+
+          if [ -n "${MODULE_ON_DISK}" ]; then
+            file "${MODULE_ON_DISK}" | tee pkcs11-module-file.txt || true
+            ls -la "${MODULE_ON_DISK}" | tee pkcs11-module-ls.txt || true
+          fi
+
+          echo "== PKCS11 slot listing using OpenSC helper container ==" | tee pkcs11-slots.txt
           : > pkcs11-slots.txt
 
-          if [ ! -f "${PKCS11_REPO_MODULE}" ]; then
-            echo "Missing PKCS11 module in repo at ${PKCS11_REPO_MODULE}" | tee -a pkcs11-slots.txt
-            echo "Commit the Signum PKCS11 module to pkcs11/signum-pkcs11.so to enable slot listing" | tee -a pkcs11-slots.txt
+          if [ -z "${MODULE_ON_DISK}" ]; then
+            echo "PKCS11 module not found so slot listing cannot run" | tee -a pkcs11-slots.txt
           else
-            echo "Using PKCS11 module from repo ${PKCS11_REPO_MODULE}" | tee -a pkcs11-slots.txt
+            docker pull ghcr.io/open-sc/opensc:latest >/dev/null 2>&1 || true
 
             docker run --rm \
-              -v "$PWD/${PKCS11_REPO_MODULE}:${PKCS11_MOUNT_PATH}:ro" \
+              -v "$PWD/${MODULE_ON_DISK}:${PKCS11_MOUNT_PATH}:ro" \
               ghcr.io/open-sc/opensc:latest \
               pkcs11-tool --module "${PKCS11_MOUNT_PATH}" --list-slots 2>&1 | tee -a pkcs11-slots.txt || true
 
             echo "" | tee -a pkcs11-slots.txt
             echo "== PKCS11 cert objects no login ==" | tee -a pkcs11-slots.txt
             docker run --rm \
-              -v "$PWD/${PKCS11_REPO_MODULE}:${PKCS11_MOUNT_PATH}:ro" \
+              -v "$PWD/${MODULE_ON_DISK}:${PKCS11_MOUNT_PATH}:ro" \
               ghcr.io/open-sc/opensc:latest \
               pkcs11-tool --module "${PKCS11_MOUNT_PATH}" --list-objects --type cert 2>&1 | tee -a pkcs11-slots.txt || true
 
@@ -166,7 +179,7 @@ jobs:
               echo "" | tee -a pkcs11-slots.txt
               echo "== PKCS11 cert objects with login ==" | tee -a pkcs11-slots.txt
               docker run --rm \
-                -v "$PWD/${PKCS11_REPO_MODULE}:${PKCS11_MOUNT_PATH}:ro" \
+                -v "$PWD/${MODULE_ON_DISK}:${PKCS11_MOUNT_PATH}:ro" \
                 ghcr.io/open-sc/opensc:latest \
                 pkcs11-tool --module "${PKCS11_MOUNT_PATH}" --login --pin "${SIGNUM_PKCS11_PIN}" --list-objects --type cert 2>&1 | tee -a pkcs11-slots.txt || true
             else
@@ -175,7 +188,7 @@ jobs:
             fi
           fi
 
-          echo "== Agent logs (tail) =="
+          echo "== Agent logs tail ==" | tee signum-agent.log
           docker logs signum-agent | tail -n 500 | tee signum-agent.log || true
 
           echo "### Signum outputs" >> "$GITHUB_STEP_SUMMARY"
@@ -185,18 +198,45 @@ jobs:
 
           echo "#### API probe" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          sed -n '1,200p' signum-api-probe.txt >> "$GITHUB_STEP_SUMMARY" || true
+          sed -n '1,160p' signum-api-probe.txt >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
 
-          echo "#### Cert listing attempt (truncated)" >> "$GITHUB_STEP_SUMMARY"
+          echo "#### PKCS11 slot listing truncated" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          sed -n '1,200p' signum-certs.txt >> "$GITHUB_STEP_SUMMARY" || true
+          sed -n '1,220p' pkcs11-slots.txt >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
 
-          echo "#### PKCS11 slot listing (truncated)" >> "$GITHUB_STEP_SUMMARY"
+          echo "#### Agent logs tail" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          sed -n '1,200p' pkcs11-slots.txt >> "$GITHUB_STEP_SUMMARY" || true
+          tail -n 200 signum-agent.log >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "
+
+          exit 0
+
+      - name: Cleanup container
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f signum-agent >/dev/null 2>&1 || true
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signum-output
+          if-no-files-found: ignore
+          path: |
+            basic-checks.txt
+            docker-pull.txt
+            docker-run.txt
+            signum-container-status.txt
+            signum-container-ports.txt
+            signum-api-probe.txt
+            signum-certs.txt
+            pkcs11-module-prep.txt
+            pkcs11-module-file.txt
+            pkcs11-module-ls.txt
+            pkcs11-slots.txt
+            signum-agent.log
+            filestosign/example-script.ps1
+            pkcs11-work/**
