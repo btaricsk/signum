@@ -1,4 +1,4 @@
-name: Signum PKCS11 cert discovery list all certs
+name: Signum PKCS11 discovery list certs
 
 on:
   workflow_dispatch:
@@ -11,6 +11,7 @@ on:
     branches: ["main"]
     paths:
       - "filestosign/**"
+      - "pkcs11/**"
 
 permissions:
   contents: read
@@ -19,20 +20,12 @@ jobs:
   pkcs11-discovery:
     runs-on: ubuntu-latest
     env:
-      SIGNUM_REGISTRY: keyfactor.jfrog.io
       DEFAULT_SIGNUM_AGENT_IMAGE: keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1
+      PKCS11_MODULE_PATH: pkcs11/signum-pkcs11.so
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Docker login keyfactor jfrog io
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.SIGNUM_REGISTRY }}
-          username: ${{ secrets.JFROG_USERNAME }}
-          password: ${{ secrets.JFROG_TOKEN }}
-          logout: true
 
       - name: Resolve agent image ref
         id: img
@@ -46,6 +39,33 @@ jobs:
           echo "image=${IMG}" >> "$GITHUB_OUTPUT"
           echo "Using agent image: ${IMG}"
 
+      - name: Validate PKCS11 module exists in repo
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "${PKCS11_MODULE_PATH}" ]; then
+            printf '%s\n' \
+              "Missing PKCS11 module at ${PKCS11_MODULE_PATH}" \
+              "This workflow expects the Signum PKCS11 .so to be committed into the repo under pkcs11/" \
+              "Add pkcs11/signum-pkcs11.so (or update PKCS11_MODULE_PATH) and rerun" \
+              | tee pkcs11-module-error.txt
+
+            echo "PKCS11 module missing see artifact pkcs11-module-error.txt" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          chmod 755 "${PKCS11_MODULE_PATH}" || true
+          file "${PKCS11_MODULE_PATH}" | tee pkcs11-module-file.txt
+          ls -la "${PKCS11_MODULE_PATH}"
+
+      - name: Install PKCS11 tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y opensc openssl
+
       - name: Start Signum Agent container
         shell: bash
         env:
@@ -56,6 +76,17 @@ jobs:
           SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
         run: |
           set -euo pipefail
+
+          echo "== Basic checks =="
+          echo "Runner: $(uname -a)"
+          echo "Docker: $(docker --version)"
+          echo "SIGNUM_HOSTNAME set? $([[ -n "${SIGNUM_HOSTNAME:-}" ]] && echo yes || echo no)"
+          echo "SIGNUM_CLIENTID set? $([[ -n "${SIGNUM_CLIENTID:-}" ]] && echo yes || echo no)"
+          echo "SIGNUM_USERNAME set? $([[ -n "${SIGNUM_USERNAME:-}" ]] && echo yes || echo no)"
+          echo "SIGNUM_PASSWORD set? $([[ -n "${SIGNUM_PASSWORD:-}" ]] && echo yes || echo no)"
+          echo "== Image ref we will use =="
+          echo "${SIGNUM_AGENT_IMAGE}"
+
           docker pull "${SIGNUM_AGENT_IMAGE}"
           docker rm -f signum-agent >/dev/null 2>&1 || true
           docker run --name signum-agent -d \
@@ -68,70 +99,29 @@ jobs:
             "${SIGNUM_AGENT_IMAGE}"
 
           docker ps -a | sed -n '1,15p'
-          docker logs signum-agent | tail -n 120 | tee signum-agent-startup.log || true
+          docker logs signum-agent | tail -n 160 | tee signum-agent-startup.log || true
 
-      - name: Install pkcs11 tooling
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y opensc openssl
-
-      - name: Materialize Signum pkcs11 module
-        shell: bash
-        env:
-          SIGNUM_PKCS11_MODULE_B64: ${{ secrets.SIGNUM_PKCS11_MODULE_B64 }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${SIGNUM_PKCS11_MODULE_B64:-}" ]; then
-            printf '%s\n' \
-              'SIGNUM_PKCS11_MODULE_B64 is missing base64 of the Signum PKCS11 so' \
-              'Common causes' \
-              '1 Secret not created in this repo Settings Secrets Actions' \
-              '2 Workflow running from a fork forks do not have upstream secrets' \
-              '3 Secret is scoped to an Environment but job is not using it' \
-              '4 Org secret not shared to this repo' \
-              > pkcs11-module-error.txt
-
-            echo "PKCS11 module missing see artifacts" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          mkdir -p pkcs11
-          echo "$SIGNUM_PKCS11_MODULE_B64" | base64 -d > pkcs11/signum-pkcs11.so
-          chmod 755 pkcs11/signum-pkcs11.so
-          file pkcs11/signum-pkcs11.so | tee pkcs11-module-file.txt
-          ls -la pkcs11/signum-pkcs11.so
-
-      - name: List all pkcs11 slots and cert objects
+      - name: List all certificates via PKCS11
         shell: bash
         env:
           SIGNUM_PKCS11_PIN: ${{ secrets.SIGNUM_PKCS11_PIN }}
         run: |
           set -euo pipefail
-          MODULE="$PWD/pkcs11/signum-pkcs11.so"
 
-          echo "== list slots ==" | tee pkcs11-slots.txt
+          MODULE="$PWD/${PKCS11_MODULE_PATH}"
+
+          echo "== pkcs11-tool list slots ==" | tee pkcs11-slots.txt
           pkcs11-tool --module "$MODULE" --list-slots | tee -a pkcs11-slots.txt
 
-          echo "== list cert objects no login ==" | tee pkcs11-certs.txt
+          echo "== pkcs11-tool list cert objects no login ==" | tee pkcs11-certs.txt
           pkcs11-tool --module "$MODULE" --list-objects --type cert 2>&1 | tee -a pkcs11-certs.txt || true
 
-          echo "== list cert objects with login if pin provided ==" | tee pkcs11-certs-with-pin.txt
+          echo "== pkcs11-tool list cert objects with login if pin provided ==" | tee pkcs11-certs-with-pin.txt
           if [ -n "${SIGNUM_PKCS11_PIN:-}" ]; then
             pkcs11-tool --module "$MODULE" --login --pin "$SIGNUM_PKCS11_PIN" --list-objects --type cert 2>&1 | tee -a pkcs11-certs-with-pin.txt || true
           else
             echo "No SIGNUM_PKCS11_PIN provided skipping login listing" | tee -a pkcs11-certs-with-pin.txt
           fi
-
-      - name: Export certs and generate inventory
-        shell: bash
-        env:
-          SIGNUM_PKCS11_PIN: ${{ secrets.SIGNUM_PKCS11_PIN }}
-        run: |
-          set -euo pipefail
-          MODULE="$PWD/pkcs11/signum-pkcs11.so"
 
           cat pkcs11-certs.txt pkcs11-certs-with-pin.txt 2>/dev/null > pkcs11-certs-all.txt || true
 
@@ -139,7 +129,7 @@ jobs:
           echo "$IDS" | tee pkcs11-object-ids.txt
 
           if [ -z "${IDS}" ]; then
-            echo "No object IDs found inspect pkcs11-certs-all.txt"
+            echo "No object IDs found inspect pkcs11-certs-all.txt" | tee pkcs11-inventory-error.txt
             exit 1
           fi
 
@@ -178,7 +168,7 @@ jobs:
 
           echo "PKCS11 certificate inventory truncated" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          sed -n '1,220p' cert-inventory.txt >> "$GITHUB_STEP_SUMMARY" || true
+          sed -n '1,240p' cert-inventory.txt >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup container
@@ -195,6 +185,7 @@ jobs:
           path: |
             pkcs11-module-error.txt
             pkcs11-module-file.txt
+            pkcs11-inventory-error.txt
             pkcs11-slots.txt
             pkcs11-certs.txt
             pkcs11-certs-with-pin.txt
