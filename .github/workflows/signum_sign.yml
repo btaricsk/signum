@@ -1,12 +1,7 @@
-name: Sign document with Signum Container Agent (basic)
+name: Sign document with Signum Container Agent (pkcs11)
 
 on:
   workflow_dispatch:
-    inputs:
-      signum_agent_image:
-        description: "Container image to use (include tag)."
-        required: false
-        default: "keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1"
   push:
     branches: ["main"]
     paths:
@@ -16,81 +11,47 @@ permissions:
   contents: read
 
 jobs:
-  sign:
+  discover-cert:
     runs-on: ubuntu-latest
     env:
-      SIGNUM_REGISTRY: keyfactor.jfrog.io
-      DEFAULT_SIGNUM_AGENT_IMAGE: keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1
+      SIGNUM_AGENT_IMAGE: keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1
+      # Target cert identity
+      TARGET_SERIAL: "2500008C4781F03B6AB4CED422000000008C47"
+      TARGET_THUMBPRINT: "1405C03B01A76072AC8E6D676957AE42B368289A"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Notes / Support Disclaimer
-        shell: bash
-        run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
-          ## Signum Container Agent – Support / Usage Notes
-          Support issues: https://support.keyfactor.com/
-          EOF
-
       - name: Docker login (keyfactor.jfrog.io)
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.SIGNUM_REGISTRY }}
+          registry: keyfactor.jfrog.io
           username: ${{ secrets.JFROG_USERNAME }}
           password: ${{ secrets.JFROG_TOKEN }}
           logout: true
 
-      - name: Resolve agent image ref
-        id: img
+      - name: Ensure there is something to sign
         shell: bash
         run: |
           set -euo pipefail
-          IMG="${{ inputs.signum_agent_image }}"
-          if [ -z "${IMG}" ]; then
-            IMG="${DEFAULT_SIGNUM_AGENT_IMAGE}"
+          mkdir -p filestosign
+          if [ ! -f "filestosign/example-script.ps1" ]; then
+            echo 'Write-Host "Hello from Signum signing demo"' > filestosign/example-script.ps1
           fi
-          echo "image=${IMG}" >> "$GITHUB_OUTPUT"
-          echo "Using agent image: ${IMG}"
 
-      - name: Run Signum Agent container and attempt cert discovery via API
+      - name: Run Signum Agent container
         shell: bash
         env:
           SIGNUM_HOSTNAME: ${{ secrets.SIGNUM_HOSTNAME }}
           SIGNUM_CLIENTID: ${{ secrets.SIGNUM_CLIENTID }}
           SIGNUM_USERNAME: ${{ secrets.SIGNUM_USERNAME }}
           SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
-          SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
         run: |
           set -euo pipefail
-
-          echo "== Basic checks =="
-          echo "Runner: $(uname -a)"
-          echo "Docker: $(docker --version)"
-          echo "SIGNUM_HOSTNAME set? $([[ -n "${SIGNUM_HOSTNAME:-}" ]] && echo yes || echo no)"
-          echo "SIGNUM_CLIENTID set? $([[ -n "${SIGNUM_CLIENTID:-}" ]] && echo yes || echo no)"
-          echo "SIGNUM_USERNAME set? $([[ -n "${SIGNUM_USERNAME:-}" ]] && echo yes || echo no)"
-          echo "SIGNUM_PASSWORD set? $([[ -n "${SIGNUM_PASSWORD:-}" ]] && echo yes || echo no)"
-          echo "== Image ref we will use (pull+run) =="
-          echo "${SIGNUM_AGENT_IMAGE}"
-
-          echo "== Ensure there is something to sign =="
-          mkdir -p filestosign
-          if [ ! -f "filestosign/example-script.ps1" ]; then
-            echo 'Write-Host "Hello from Signum signing demo"' > filestosign/example-script.ps1
-          fi
-
-          echo "== Pull Signum agent image =="
           docker pull "${SIGNUM_AGENT_IMAGE}"
-
-          echo "== Run container (publish common API ports) =="
           docker rm -f signum-agent >/dev/null 2>&1 || true
           docker run --name signum-agent -d \
-            -p 8080:8080 \
-            -p 5000:5000 \
-            -p 7000:7000 \
-            -v "$PWD/filestosign:/mnt/filestosign" \
             -e "SIGNUM_HOSTNAME=$SIGNUM_HOSTNAME" \
             -e "SIGNUM_CLIENTID=$SIGNUM_CLIENTID" \
             -e "SIGNUM_USERNAME=$SIGNUM_USERNAME" \
@@ -98,71 +59,102 @@ jobs:
             -e "SIGNUM_LOGLEVEL=HIGH" \
             -e "SIGNUM_LOGTYPE=FILE" \
             "${SIGNUM_AGENT_IMAGE}"
+          docker ps -a | sed -n '1,10p'
 
-          echo "== Container status =="
-          docker ps -a | sed -n '1,20p'
-          docker port signum-agent | tee signum-container-ports.txt || true
+      - name: Install OpenSC tools (pkcs11-tool)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y opensc
 
-          echo "== Wait briefly for service startup =="
-          sleep 3
+      - name: Locate PKCS11 module in container (best effort)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The image log suggests OpenSC exists at /opt/opensc/bin. The PKCS11 module is usually a .so.
+          # We'll search for likely pkcs11 modules inside the container and copy them out.
+          docker exec signum-agent sh -lc 'find / -maxdepth 6 -type f \( -name "*pkcs11*.so" -o -name "opensc-pkcs11.so" \) 2>/dev/null | sed -n "1,200p"' | tee pkcs11-modules.txt
+          MOD="$(head -n 1 pkcs11-modules.txt || true)"
+          if [ -z "$MOD" ]; then
+            echo "No pkcs11 module found in container via search. You likely need the Signum PKCS11 driver installed on runner."
+            exit 1
+          fi
+          echo "Using module: $MOD"
+          docker cp "signum-agent:$MOD" ./signum-pkcs11.so
+          ls -la ./signum-pkcs11.so
 
-          echo "== Probe agent HTTP endpoints (best effort) =="
-          : > signum-api-probe.txt
-          for port in 8080 5000 7000; do
-            for path in /swagger /swagger/index.html /health /healthz /api/health /api/status /; do
-              url="http://127.0.0.1:${port}${path}"
-              code="$(curl -s -o /dev/null -w '%{http_code}' "$url" || true)"
-              echo "${code} ${url}" | tee -a signum-api-probe.txt
-            done
+      - name: Enumerate tokens and certificates (PKCS11)
+        shell: bash
+        run: |
+          set -euo pipefail
+          MODULE="$PWD/signum-pkcs11.so"
+
+          echo "== pkcs11-tool --list-slots =="
+          pkcs11-tool --module "$MODULE" --list-slots | tee pkcs11-slots.txt
+
+          echo "== pkcs11-tool --list-objects (certs) =="
+          # We don't pass PIN here yet. Some modules allow cert listing without it.
+          pkcs11-tool --module "$MODULE" --list-objects --type cert 2>&1 | tee pkcs11-certs.txt || true
+
+          echo "== Try with PIN if required =="
+          if grep -qiE 'PIN|CKR_PIN|login' pkcs11-certs.txt; then
+            pkcs11-tool --module "$MODULE" --login --pin "${{ secrets.SIGNUM_PKCS11_PIN }}" --list-objects --type cert 2>&1 | tee pkcs11-certs-with-pin.txt
+          fi
+
+      - name: Find target cert by serial or thumbprint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Combine outputs
+          cat pkcs11-certs.txt pkcs11-certs-with-pin.txt 2>/dev/null > pkcs11-certs-all.txt || true
+
+          # Try to match serial directly
+          if grep -q "${TARGET_SERIAL}" pkcs11-certs-all.txt; then
+            echo "Found serial in PKCS11 output."
+          else
+            echo "Did not see the serial in raw listing output. Next step will be to extract cert(s) and compute fingerprints."
+          fi
+
+          # Export all cert objects and compute SHA1 thumbprints (most Authenticode thumbprints are SHA1)
+          mkdir -p exported-certs
+          idx=0
+          # Extract object IDs from pkcs11-tool output if present (commonly "ID: xx" lines)
+          IDS=$(awk '/^  ID:/{print $2}' pkcs11-certs-all.txt | sort -u)
+          if [ -z "$IDS" ]; then
+            echo "No object IDs detected in output; cannot auto-export certs. See pkcs11-certs-all.txt for format."
+            exit 1
+          fi
+
+          for id in $IDS; do
+            idx=$((idx+1))
+            out="exported-certs/cert-${idx}.der"
+            echo "Exporting cert with id=$id -> $out"
+            pkcs11-tool --module "$PWD/signum-pkcs11.so" --read-object --type cert --id "$id" --output-file "$out" 2>/dev/null || true
           done
 
-          echo "== Attempt cert listing via likely API routes (best effort) =="
-          : > signum-certs.txt
-          set +e
-          for port in 8080 5000 7000; do
-            for path in \
-              /api/certificates \
-              /api/certs \
-              /api/v1/certificates \
-              /api/v1/certs \
-              /certificates \
-              /certs \
-              /swagger/v1/swagger.json
-            do
-              url="http://127.0.0.1:${port}${path}"
-              echo "== GET ${url} ==" | tee -a signum-certs.txt
-              curl -sS "$url" | head -c 20000 | tee -a signum-certs.txt
-              echo -e "\n" >> signum-certs.txt
-            done
+          echo "== Compute thumbprints =="
+          : > cert-matches.txt
+          for f in exported-certs/*.der; do
+            [ -f "$f" ] || continue
+            sha1="$(openssl x509 -inform der -in "$f" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d :)"
+            serial="$(openssl x509 -inform der -in "$f" -noout -serial | cut -d= -f2 | tr '[:lower:]' '[:upper:]')"
+            echo "$f serial=$serial thumbprint=$sha1" | tee -a cert-matches.txt
           done
-          CERT_RC=${PIPESTATUS[0]}
-          set -e
 
-          echo "== Agent logs (tail) =="
-          docker logs signum-agent | tail -n 500 | tee signum-agent.log || true
+          echo "== Select target cert =="
+          match_line="$(grep -i "${TARGET_THUMBPRINT}" cert-matches.txt | head -n 1 || true)"
+          if [ -z "$match_line" ]; then
+            echo "Target thumbprint not found in exported certs."
+            exit 1
+          fi
 
-          echo "### Signum outputs" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Image:** \`${SIGNUM_AGENT_IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "#### API probe" >> "$GITHUB_STEP_SUMMARY"
+          echo "$match_line" | tee selected-cert.txt
+          echo "### Selected cert" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          sed -n '1,200p' signum-api-probe.txt >> "$GITHUB_STEP_SUMMARY" || true
+          cat selected-cert.txt >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "#### Cert listing attempt (truncated)" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          sed -n '1,200p' signum-certs.txt >> "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "#### Agent logs (tail)" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          tail -n 200 signum-agent.log >> "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-
-          # Don't fail on probe by default; we want artifacts even if routes differ.
-          # If you want strict failure once the correct endpoint is known, we can tighten this later.
-          exit 0
 
       - name: Cleanup container
         if: always()
@@ -170,14 +162,18 @@ jobs:
         run: |
           docker rm -f signum-agent >/dev/null 2>&1 || true
 
-      - name: Upload output
+      - name: Upload discovery output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: signum-output
+          name: signum-pkcs11-discovery
           path: |
-            signum-certs.txt
-            signum-api-probe.txt
-            signum-container-ports.txt
-            signum-agent.log
+            pkcs11-modules.txt
+            pkcs11-slots.txt
+            pkcs11-certs.txt
+            pkcs11-certs-with-pin.txt
+            pkcs11-certs-all.txt
+            exported-certs/
+            cert-matches.txt
+            selected-cert.txt
             filestosign/example-script.ps1
