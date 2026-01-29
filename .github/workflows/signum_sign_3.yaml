@@ -1,95 +1,204 @@
-      - name: Download latest Signum linux agent (resolve real file via storage API)
+name: Signum PKCS11 cert discovery list all certs
+
+on:
+  workflow_dispatch:
+    inputs:
+      signum_agent_image:
+        description: "Agent container image to run include tag"
+        required: false
+        default: "keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1"
+  push:
+    branches: ["main"]
+    paths:
+      - "filestosign/**"
+
+permissions:
+  contents: read
+
+jobs:
+  pkcs11-discovery:
+    runs-on: ubuntu-latest
+    env:
+      SIGNUM_REGISTRY: keyfactor.jfrog.io
+      DEFAULT_SIGNUM_AGENT_IMAGE: keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Docker login keyfactor jfrog io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.SIGNUM_REGISTRY }}
+          username: ${{ secrets.JFROG_USERNAME }}
+          password: ${{ secrets.JFROG_TOKEN }}
+          logout: true
+
+      - name: Resolve agent image ref
+        id: img
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="${{ github.event.inputs.signum_agent_image }}"
+          if [ -z "${IMG}" ]; then
+            IMG="${DEFAULT_SIGNUM_AGENT_IMAGE}"
+          fi
+          echo "image=${IMG}" >> "$GITHUB_OUTPUT"
+          echo "Using agent image: ${IMG}"
+
+      - name: Start Signum Agent container
         shell: bash
         env:
-          JFROG_BASE_URL: https://keyfactor.jfrog.io/artifactory
-          JFROG_REPO: signum-bdewberry-testing
-          AGENT_PARENT_PATH: keyfactor/signum-linux-agent
-          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
-          JFROG_TOKEN:    ${{ secrets.JFROG_TOKEN }}
+          SIGNUM_HOSTNAME: ${{ secrets.SIGNUM_HOSTNAME }}
+          SIGNUM_CLIENTID: ${{ secrets.SIGNUM_CLIENTID }}
+          SIGNUM_USERNAME: ${{ secrets.SIGNUM_USERNAME }}
+          SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
+          SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker pull "${SIGNUM_AGENT_IMAGE}"
+          docker rm -f signum-agent >/dev/null 2>&1 || true
+          docker run --name signum-agent -d \
+            -e "SIGNUM_HOSTNAME=$SIGNUM_HOSTNAME" \
+            -e "SIGNUM_CLIENTID=$SIGNUM_CLIENTID" \
+            -e "SIGNUM_USERNAME=$SIGNUM_USERNAME" \
+            -e "SIGNUM_PASSWORD=$SIGNUM_PASSWORD" \
+            -e "SIGNUM_LOGLEVEL=HIGH" \
+            -e "SIGNUM_LOGTYPE=FILE" \
+            "${SIGNUM_AGENT_IMAGE}"
+
+          docker ps -a | sed -n '1,15p'
+          docker logs signum-agent | tail -n 120 | tee signum-agent-startup.log || true
+
+      - name: Install pkcs11 tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y opensc openssl
+
+      - name: Materialize Signum pkcs11 module
+        shell: bash
+        env:
+          SIGNUM_PKCS11_MODULE_B64: ${{ secrets.SIGNUM_PKCS11_MODULE_B64 }}
         run: |
           set -euo pipefail
 
-          mkdir -p signum-agent-download
-
-          FILE_PATH="$(python3 - <<'PY'
-          import base64, json, os, sys, urllib.request, urllib.error
-
-          base = os.environ["JFROG_BASE_URL"].rstrip("/")
-          repo = os.environ["JFROG_REPO"]
-          parent = os.environ["AGENT_PARENT_PATH"].strip("/")
-          user = os.environ["JFROG_USERNAME"]
-          token = os.environ["JFROG_TOKEN"]
-
-          def get_json(url: str) -> dict:
-            req = urllib.request.Request(url)
-            auth = base64.b64encode(f"{user}:{token}".encode()).decode()
-            req.add_header("Authorization", f"Basic {auth}")
-            req.add_header("Accept", "application/json")
-            with urllib.request.urlopen(req) as resp:
-              return json.loads(resp.read().decode())
-
-          def children(path: str):
-            url = f"{base}/api/storage/{repo}/{path}"
-            j = get_json(url)
-            return [c["uri"].lstrip("/") for c in j.get("children", [])]
-
-          def looks_like_file(name: str) -> bool:
-            # Generic repos usually have extensions; this is a heuristic
-            return "." in name.split("/")[-1]
-
-          # 1) list parent
-          kids = children(parent)
-          if not kids:
-            print(f"No children under {parent}", file=sys.stderr)
-            sys.exit(1)
-
-          # prefer 'latest' folder if present, else choose lexicographically last child
-          chosen = f"{parent}/latest" if "latest" in kids else f"{parent}/" + sorted(kids)[-1]
-
-          # 2) resolve down to a file
-          def resolve_to_file(path: str) -> str:
-            try:
-              kids2 = children(path)
-            except urllib.error.HTTPError as e:
-              # If storage API returns non-JSON for a file, treat as file
-              if e.code in (404, 400):
-                return path
-              raise
-
-            if kids2:
-              files = [k for k in kids2 if looks_like_file(k)]
-              if files:
-                return path.rstrip("/") + "/" + sorted(files)[0]
-              # descend into first child folder
-              return resolve_to_file(path.rstrip("/") + "/" + sorted(kids2)[0])
-            return path
-
-          print(resolve_to_file(chosen))
-          PY
-          )"
-
-          echo "Resolved file path: ${FILE_PATH}"
-
-          FILE_URL="${JFROG_BASE_URL%/}/${JFROG_REPO}/${FILE_PATH}"
-          OUT="signum-agent-download/$(basename "${FILE_PATH}")"
-
-          echo "Downloading from:"
-          echo "${FILE_URL}"
-
-          curl -fLsS -u "${JFROG_USERNAME}:${JFROG_TOKEN}" -o "${OUT}" "${FILE_URL}"
-
-          echo "== Downloaded file info =="
-          ls -lah signum-agent-download
-          file "${OUT}" || true
-
-          if file "${OUT}" | grep -qiE 'zip archive'; then
-            echo "Detected ZIP; extracting..."
-            unzip -o "${OUT}" -d signum-agent-download
-          elif file "${OUT}" | grep -qiE 'gzip compressed|tar archive'; then
-            echo "Detected tar/gz; extracting..."
-            tar -xf "${OUT}" -C signum-agent-download || tar -xzf "${OUT}" -C signum-agent-download
+          if [ -z "${SIGNUM_PKCS11_MODULE_B64:-}" ]; then
+            cat > pkcs11-module-error.txt <<'EOF'
+SIGNUM_PKCS11_MODULE_B64 is missing base64 of the Signum PKCS11 so
+Common causes
+1 Secret not created in this repo Settings Secrets Actions
+2 Workflow running from a fork forks do not have upstream secrets
+3 Secret is scoped to an Environment but job is not using it
+4 Org secret not shared to this repo
+EOF
+            echo "PKCS11 module missing see artifacts" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
 
-          echo "### Downloaded Signum agent artifact" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Source: ${FILE_URL}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Output: ${OUT}" >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p pkcs11
+          echo "$SIGNUM_PKCS11_MODULE_B64" | base64 -d > pkcs11/signum-pkcs11.so
+          chmod 755 pkcs11/signum-pkcs11.so
+          file pkcs11/signum-pkcs11.so | tee pkcs11-module-file.txt
+          ls -la pkcs11/signum-pkcs11.so
+
+      - name: List all pkcs11 slots and cert objects
+        shell: bash
+        env:
+          SIGNUM_PKCS11_PIN: ${{ secrets.SIGNUM_PKCS11_PIN }}
+        run: |
+          set -euo pipefail
+          MODULE="$PWD/pkcs11/signum-pkcs11.so"
+
+          echo "== list slots ==" | tee pkcs11-slots.txt
+          pkcs11-tool --module "$MODULE" --list-slots | tee -a pkcs11-slots.txt
+
+          echo "== list cert objects no login ==" | tee pkcs11-certs.txt
+          pkcs11-tool --module "$MODULE" --list-objects --type cert 2>&1 | tee -a pkcs11-certs.txt || true
+
+          echo "== list cert objects with login if pin provided ==" | tee pkcs11-certs-with-pin.txt
+          if [ -n "${SIGNUM_PKCS11_PIN:-}" ]; then
+            pkcs11-tool --module "$MODULE" --login --pin "$SIGNUM_PKCS11_PIN" --list-objects --type cert 2>&1 | tee -a pkcs11-certs-with-pin.txt || true
+          else
+            echo "No SIGNUM_PKCS11_PIN provided skipping login listing" | tee -a pkcs11-certs-with-pin.txt
+          fi
+
+      - name: Export certs and generate inventory
+        shell: bash
+        env:
+          SIGNUM_PKCS11_PIN: ${{ secrets.SIGNUM_PKCS11_PIN }}
+        run: |
+          set -euo pipefail
+          MODULE="$PWD/pkcs11/signum-pkcs11.so"
+
+          cat pkcs11-certs.txt pkcs11-certs-with-pin.txt 2>/dev/null > pkcs11-certs-all.txt || true
+
+          IDS="$(awk '/^[[:space:]]*ID:/{print $2}' pkcs11-certs-all.txt | sort -u | tr -d '\r')"
+          echo "$IDS" | tee pkcs11-object-ids.txt
+
+          if [ -z "${IDS}" ]; then
+            echo "No object IDs found inspect pkcs11-certs-all.txt"
+            exit 1
+          fi
+
+          mkdir -p exported-certs
+          i=0
+          for id in $IDS; do
+            i=$((i+1))
+            out="exported-certs/cert-${i}.der"
+            if [ -n "${SIGNUM_PKCS11_PIN:-}" ]; then
+              pkcs11-tool --module "$MODULE" --login --pin "$SIGNUM_PKCS11_PIN" \
+                --read-object --type cert --id "$id" --output-file "$out" 2>/dev/null || true
+            else
+              pkcs11-tool --module "$MODULE" \
+                --read-object --type cert --id "$id" --output-file "$out" 2>/dev/null || true
+            fi
+          done
+
+          : > cert-inventory.txt
+          for f in exported-certs/*.der; do
+            [ -s "$f" ] || continue
+            serial="$(openssl x509 -inform der -in "$f" -noout -serial | cut -d= -f2 | tr '[:lower:]' '[:upper:]')"
+            thumb="$(openssl x509 -inform der -in "$f" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d : | tr '[:lower:]' '[:upper:]')"
+            subj="$(openssl x509 -inform der -in "$f" -noout -subject | sed 's/^subject=//')"
+            issr="$(openssl x509 -inform der -in "$f" -noout -issuer  | sed 's/^issuer=//')"
+            nb="$(openssl x509 -inform der -in "$f" -noout -startdate | cut -d= -f2)"
+            na="$(openssl x509 -inform der -in "$f" -noout -enddate   | cut -d= -f2)"
+            echo "$f" >> cert-inventory.txt
+            echo "  serial:      $serial" >> cert-inventory.txt
+            echo "  thumbprint:  $thumb" >> cert-inventory.txt
+            echo "  notBefore:   $nb" >> cert-inventory.txt
+            echo "  notAfter:    $na" >> cert-inventory.txt
+            echo "  subject:     $subj" >> cert-inventory.txt
+            echo "  issuer:      $issr" >> cert-inventory.txt
+            echo "" >> cert-inventory.txt
+          done
+
+          echo "PKCS11 certificate inventory truncated" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          sed -n '1,220p' cert-inventory.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup container
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f signum-agent >/dev/null 2>&1 || true
+
+      - name: Upload outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signum-pkcs11-output
+          path: |
+            pkcs11-module-error.txt
+            pkcs11-module-file.txt
+            pkcs11-slots.txt
+            pkcs11-certs.txt
+            pkcs11-certs-with-pin.txt
+            pkcs11-certs-all.txt
+            pkcs11-object-ids.txt
+            exported-certs/
+            cert-inventory.txt
+            signum-agent-startup.log
