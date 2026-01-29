@@ -8,7 +8,7 @@ on:
         required: false
         default: "keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1"
       pkcs11_module_path:
-        description: "Optional path to PKCS11 .so in repo (default pkcs11/signum-pkcs11.so)"
+        description: "Path to PKCS11 so in repo default pkcs11 signum pkcs11 so"
         required: false
         default: "pkcs11/signum-pkcs11.so"
   push:
@@ -29,6 +29,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Create run info
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "date_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "runner=$(uname -a)"
+            echo "pwd=$(pwd)"
+            echo "repo=$GITHUB_REPOSITORY"
+            echo "sha=$GITHUB_SHA"
+          } > run-info.txt
 
       - name: Resolve agent image and module path
         id: vars
@@ -70,15 +83,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "== Basic checks =="
-          echo "Runner: $(uname -a)"
-          echo "Docker: $(docker --version)"
-          echo "SIGNUM_HOSTNAME set? $([[ -n "${SIGNUM_HOSTNAME:-}" ]] && echo yes || echo no)"
-          echo "SIGNUM_CLIENTID set? $([[ -n "${SIGNUM_CLIENTID:-}" ]] && echo yes || echo no)"
-          echo "SIGNUM_USERNAME set? $([[ -n "${SIGNUM_USERNAME:-}" ]] && echo yes || echo no)"
-          echo "SIGNUM_PASSWORD set? $([[ -n "${SIGNUM_PASSWORD:-}" ]] && echo yes || echo no)"
-          echo "== Image ref we will use =="
-          echo "${SIGNUM_AGENT_IMAGE}"
+          echo "== Basic checks ==" | tee basic-checks.txt
+          echo "Runner: $(uname -a)" | tee -a basic-checks.txt
+          echo "Docker: $(docker --version)" | tee -a basic-checks.txt
+          echo "SIGNUM_HOSTNAME set? $([[ -n "${SIGNUM_HOSTNAME:-}" ]] && echo yes || echo no)" | tee -a basic-checks.txt
+          echo "SIGNUM_CLIENTID set? $([[ -n "${SIGNUM_CLIENTID:-}" ]] && echo yes || echo no)" | tee -a basic-checks.txt
+          echo "SIGNUM_USERNAME set? $([[ -n "${SIGNUM_USERNAME:-}" ]] && echo yes || echo no)" | tee -a basic-checks.txt
+          echo "SIGNUM_PASSWORD set? $([[ -n "${SIGNUM_PASSWORD:-}" ]] && echo yes || echo no)" | tee -a basic-checks.txt
+          echo "Image: ${SIGNUM_AGENT_IMAGE}" | tee -a basic-checks.txt
 
           docker pull "${SIGNUM_AGENT_IMAGE}"
           docker rm -f signum-agent >/dev/null 2>&1 || true
@@ -91,10 +103,10 @@ jobs:
             -e "SIGNUM_LOGTYPE=FILE" \
             "${SIGNUM_AGENT_IMAGE}"
 
-          docker ps -a | sed -n '1,15p'
-          docker logs signum-agent | tail -n 200 | tee signum-agent-startup.log || true
+          docker ps -a | sed -n '1,15p' | tee signum-container-status.txt
+          docker logs signum-agent | tail -n 220 | tee signum-agent-startup.log || true
 
-      - name: Locate PKCS11 module (repo first, then container fallback)
+      - name: Locate PKCS11 module
         id: mod
         shell: bash
         env:
@@ -104,17 +116,17 @@ jobs:
 
           FOUND=""
 
-          echo "== Check repo path: ${REPO_MODULE_PATH} =="
           if [ -f "${REPO_MODULE_PATH}" ]; then
             FOUND="${REPO_MODULE_PATH}"
+          else
+            echo "Repo module not found at ${REPO_MODULE_PATH}" | tee pkcs11-module-missing.txt
           fi
 
           if [ -z "${FOUND}" ]; then
-            echo "== Repo module not found. Attempt search inside container (best effort) =="
             docker exec signum-agent sh -lc 'find / -maxdepth 7 -type f \( -name "*pkcs11*.so" -o -name "opensc-pkcs11.so" \) 2>/dev/null | sed -n "1,200p"' | tee pkcs11-modules-in-container.txt || true
             CANDIDATE="$(head -n 1 pkcs11-modules-in-container.txt || true)"
             if [ -n "${CANDIDATE}" ]; then
-              echo "Found candidate in container: ${CANDIDATE}"
+              echo "Found candidate in container: ${CANDIDATE}" | tee pkcs11-module-found.txt
               docker cp "signum-agent:${CANDIDATE}" ./signum-pkcs11.so
               chmod 755 ./signum-pkcs11.so || true
               FOUND="$PWD/signum-pkcs11.so"
@@ -123,9 +135,9 @@ jobs:
 
           if [ -z "${FOUND}" ]; then
             printf '%s\n' \
-              "No PKCS11 module found." \
-              "Expected it in the repo at ${REPO_MODULE_PATH} (commit it under pkcs11/), OR use an agent image that includes it." \
-              "This dev oci agent image does not appear to ship the PKCS11 module." \
+              "No PKCS11 module found" \
+              "Expected repo path ${REPO_MODULE_PATH} or an agent image that includes the module" \
+              "This agent image does not appear to contain a PKCS11 module" \
               > pkcs11-module-error.txt
 
             echo "### PKCS11 module not found" >> "$GITHUB_STEP_SUMMARY"
@@ -136,10 +148,8 @@ jobs:
           fi
 
           echo "module=${FOUND}" >> "$GITHUB_OUTPUT"
-          echo "Using PKCS11 module: ${FOUND}"
-
           file "${FOUND}" | tee pkcs11-module-file.txt
-          ls -la "${FOUND}"
+          ls -la "${FOUND}" | tee pkcs11-module-ls.txt
 
       - name: List all certificates via PKCS11
         shell: bash
@@ -150,17 +160,14 @@ jobs:
           set -euo pipefail
           MODULE="${MODULE_PATH}"
 
-          echo "== pkcs11-tool list slots ==" | tee pkcs11-slots.txt
-          pkcs11-tool --module "$MODULE" --list-slots | tee -a pkcs11-slots.txt
+          pkcs11-tool --module "$MODULE" --list-slots | tee pkcs11-slots.txt
 
-          echo "== pkcs11-tool list cert objects no login ==" | tee pkcs11-certs.txt
-          pkcs11-tool --module "$MODULE" --list-objects --type cert 2>&1 | tee -a pkcs11-certs.txt || true
+          pkcs11-tool --module "$MODULE" --list-objects --type cert 2>&1 | tee pkcs11-certs.txt || true
 
-          echo "== pkcs11-tool list cert objects with login if pin provided ==" | tee pkcs11-certs-with-pin.txt
           if [ -n "${SIGNUM_PKCS11_PIN:-}" ]; then
-            pkcs11-tool --module "$MODULE" --login --pin "$SIGNUM_PKCS11_PIN" --list-objects --type cert 2>&1 | tee -a pkcs11-certs-with-pin.txt || true
+            pkcs11-tool --module "$MODULE" --login --pin "$SIGNUM_PKCS11_PIN" --list-objects --type cert 2>&1 | tee pkcs11-certs-with-pin.txt || true
           else
-            echo "No SIGNUM_PKCS11_PIN provided skipping login listing" | tee -a pkcs11-certs-with-pin.txt
+            echo "No SIGNUM_PKCS11_PIN provided skipping login listing" | tee pkcs11-certs-with-pin.txt
           fi
 
           cat pkcs11-certs.txt pkcs11-certs-with-pin.txt 2>/dev/null > pkcs11-certs-all.txt || true
@@ -169,7 +176,7 @@ jobs:
           echo "$IDS" | tee pkcs11-object-ids.txt
 
           if [ -z "${IDS}" ]; then
-            echo "No object IDs found inspect pkcs11-certs-all.txt"
+            echo "No object IDs found inspect pkcs11-certs-all.txt" | tee pkcs11-inventory-error.txt
             exit 1
           fi
 
@@ -222,16 +229,24 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: signum-pkcs11-output
+          if-no-files-found: ignore
           path: |
+            run-info.txt
+            basic-checks.txt
+            signum-container-status.txt
             pkcs11-module-error.txt
+            pkcs11-module-missing.txt
+            pkcs11-module-found.txt
             pkcs11-module-file.txt
+            pkcs11-module-ls.txt
             pkcs11-modules-in-container.txt
+            pkcs11-inventory-error.txt
             pkcs11-slots.txt
             pkcs11-certs.txt
             pkcs11-certs-with-pin.txt
             pkcs11-certs-all.txt
             pkcs11-object-ids.txt
-            exported-certs/
+            exported-certs/**
             cert-inventory.txt
             signum-agent-startup.log
             signum-pkcs11.so
