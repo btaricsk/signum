@@ -57,7 +57,7 @@ jobs:
           echo "image=${IMG}" >> "$GITHUB_OUTPUT"
           echo "Using agent image: ${IMG}"
 
-      - name: Run Signum Agent container and list available certs (debug)
+      - name: Run Signum Agent container and collect debug info
         shell: bash
         env:
           SIGNUM_HOSTNAME: ${{ secrets.SIGNUM_HOSTNAME }}
@@ -103,12 +103,61 @@ jobs:
           echo "== Container status =="
           docker ps -a | sed -n '1,15p'
 
-          echo "== List certs (signum-util lc) =="
-          docker exec signum-agent signum-util lc | tee signum-certs.txt
+          echo "== Debug: PATH and basic filesystem =="
+          docker exec signum-agent sh -lc 'echo "PATH=$PATH"; whoami; uname -a; ls -la /; true' | tee signum-container-debug.txt
 
-          echo "### Signum cert listing (signum-util lc)" >> "$GITHUB_STEP_SUMMARY"
+          echo "== Debug: look for signum utilities =="
+          docker exec signum-agent sh -lc '
+            set +e
+            for d in /usr/local/bin /usr/bin /bin /opt /opt/keyfactor /usr/local/keyfactor /app; do
+              [ -d "$d" ] && echo "--- $d ---" && ls -la "$d" | sed -n "1,200p"
+            done
+            echo "== which signum-util ==" && which signum-util
+            echo "== which signum ==" && which signum
+            echo "== find signum* (limited) ==" &&
+              (find / -maxdepth 4 -type f -name "signum*" 2>/dev/null | sed -n "1,200p")
+            true
+          ' | tee -a signum-container-debug.txt
+
+          echo "== Try to list certs (best effort) =="
+          set +e
+          docker exec signum-agent sh -lc '
+            set -e
+            if command -v signum-util >/dev/null 2>&1; then
+              signum-util lc
+            elif command -v signum >/dev/null 2>&1; then
+              signum lc
+            elif [ -x /usr/local/keyfactor/signum-util ]; then
+              /usr/local/keyfactor/signum-util lc
+            elif [ -x /opt/keyfactor/signum-util ]; then
+              /opt/keyfactor/signum-util lc
+            else
+              echo "No signum CLI found in this image. This image likely does not include signing tools."
+              exit 42
+            fi
+          ' | tee signum-certs.txt
+          CERT_RC=${PIPESTATUS[0]}
+          set -e
+
+          echo "== Container logs (tail) =="
+          docker logs signum-agent | tail -n 400 | tee signum-agent.log || true
+
+          echo "### Signum output" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Image:** \`${SIGNUM_AGENT_IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Cert listing attempt exit code:** \`${CERT_RC}\`" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "#### signum-certs.txt" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat signum-certs.txt >> "$GITHUB_STEP_SUMMARY"
+          sed -n '1,200p' signum-certs.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "#### signum-agent.log (tail)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -n 200 signum-agent.log >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup container
@@ -124,4 +173,6 @@ jobs:
           name: signum-output
           path: |
             signum-certs.txt
+            signum-agent.log
+            signum-container-debug.txt
             filestosign/example-script.ps1
