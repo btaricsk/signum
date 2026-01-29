@@ -1,7 +1,12 @@
-name: Signum PKCS11 cert discovery (by thumbprint)
+name: Signum PKCS11 cert discovery (list all certs)
 
 on:
   workflow_dispatch:
+    inputs:
+      signum_agent_image:
+        description: "Agent container image to run (include tag)."
+        required: false
+        default: "keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1"
   push:
     branches: ["main"]
     paths:
@@ -15,14 +20,20 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SIGNUM_REGISTRY: keyfactor.jfrog.io
-      SIGNUM_AGENT_IMAGE: keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1
-
-      TARGET_SERIAL: "2500008C4781F03B6AB4CED422000000008C47"
-      TARGET_THUMBPRINT: "1405C03B01A76072AC8E6D676957AE42B368289A"
+      DEFAULT_SIGNUM_AGENT_IMAGE: keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Notes / Support Disclaimer
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Signum PKCS11 Discovery – Support / Usage Notes
+          This workflow runs the Signum Agent container, then uses a Signum PKCS11 module on the runner to enumerate available certificate objects.
+          Support issues: https://support.keyfactor.com/
+          EOF
 
       - name: Docker login (keyfactor.jfrog.io)
         uses: docker/login-action@v3
@@ -32,14 +43,17 @@ jobs:
           password: ${{ secrets.JFROG_TOKEN }}
           logout: true
 
-      - name: Ensure there is something to sign
+      - name: Resolve agent image ref
+        id: img
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p filestosign
-          if [ ! -f "filestosign/example-script.ps1" ]; then
-            echo 'Write-Host "Hello from Signum signing demo"' > filestosign/example-script.ps1
+          IMG="${{ inputs.signum_agent_image }}"
+          if [ -z "${IMG}" ]; then
+            IMG="${DEFAULT_SIGNUM_AGENT_IMAGE}"
           fi
+          echo "image=${IMG}" >> "$GITHUB_OUTPUT"
+          echo "Using agent image: ${IMG}"
 
       - name: Start Signum Agent container
         shell: bash
@@ -48,6 +62,7 @@ jobs:
           SIGNUM_CLIENTID: ${{ secrets.SIGNUM_CLIENTID }}
           SIGNUM_USERNAME: ${{ secrets.SIGNUM_USERNAME }}
           SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
+          SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
         run: |
           set -euo pipefail
           docker pull "${SIGNUM_AGENT_IMAGE}"
@@ -60,24 +75,42 @@ jobs:
             -e "SIGNUM_LOGLEVEL=HIGH" \
             -e "SIGNUM_LOGTYPE=FILE" \
             "${SIGNUM_AGENT_IMAGE}"
-          docker ps -a | sed -n '1,15p'
-          docker logs signum-agent | tail -n 80 | tee signum-agent-startup.log || true
 
-      - name: Install tools (OpenSC + OpenSSL)
+          echo "== Container status =="
+          docker ps -a | sed -n '1,15p'
+          echo "== Container logs (startup tail) =="
+          docker logs signum-agent | tail -n 120 | tee signum-agent-startup.log || true
+
+      - name: Install PKCS11 tooling (OpenSC + OpenSSL)
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y opensc openssl
 
+      # Provide the Signum PKCS11 module via secret (base64 of .so).
+      # In a fork, secrets will be empty; this step will fail with a clear message.
       - name: Materialize Signum PKCS11 module
         shell: bash
         env:
           SIGNUM_PKCS11_MODULE_B64: ${{ secrets.SIGNUM_PKCS11_MODULE_B64 }}
         run: |
           set -euo pipefail
+
           if [ -z "${SIGNUM_PKCS11_MODULE_B64:-}" ]; then
-            echo "Missing secret SIGNUM_PKCS11_MODULE_B64 (base64 of the PKCS11 .so)."
+            cat > pkcs11-module-error.txt <<'EOF'
+            SIGNUM_PKCS11_MODULE_B64 is missing (base64 of the Signum PKCS11 .so).
+            Common causes:
+            1) Secret not created in this repo (Settings -> Secrets -> Actions).
+            2) Workflow running from a fork (fork runs do not have upstream secrets).
+            3) Secret is scoped to an Environment but job isn't using it.
+            4) Org secret not shared to this repo.
+            EOF
+
+            echo "### PKCS11 module missing" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat pkcs11-module-error.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
@@ -87,7 +120,7 @@ jobs:
           file pkcs11/signum-pkcs11.so | tee pkcs11-module-file.txt
           ls -la pkcs11/signum-pkcs11.so
 
-      - name: PKCS11 list slots and cert objects
+      - name: List all PKCS11 slots and cert objects
         shell: bash
         env:
           SIGNUM_PKCS11_PIN: ${{ secrets.SIGNUM_PKCS11_PIN }}
@@ -95,20 +128,20 @@ jobs:
           set -euo pipefail
           MODULE="$PWD/pkcs11/signum-pkcs11.so"
 
-          echo "== pkcs11-tool --list-slots =="
-          pkcs11-tool --module "$MODULE" --list-slots | tee pkcs11-slots.txt
+          echo "== pkcs11-tool --list-slots ==" | tee pkcs11-slots.txt
+          pkcs11-tool --module "$MODULE" --list-slots | tee -a pkcs11-slots.txt
 
-          echo "== pkcs11-tool --list-objects (certs, no login) =="
-          pkcs11-tool --module "$MODULE" --list-objects --type cert 2>&1 | tee pkcs11-certs.txt || true
+          echo "== pkcs11-tool --list-objects --type cert (no login) ==" | tee pkcs11-certs.txt
+          pkcs11-tool --module "$MODULE" --list-objects --type cert 2>&1 | tee -a pkcs11-certs.txt || true
 
-          echo "== pkcs11-tool --list-objects (certs, with login if PIN provided) =="
+          echo "== pkcs11-tool --list-objects --type cert (with login, if PIN provided) ==" | tee pkcs11-certs-with-pin.txt
           if [ -n "${SIGNUM_PKCS11_PIN:-}" ]; then
-            pkcs11-tool --module "$MODULE" --login --pin "$SIGNUM_PKCS11_PIN" --list-objects --type cert 2>&1 | tee pkcs11-certs-with-pin.txt || true
+            pkcs11-tool --module "$MODULE" --login --pin "$SIGNUM_PKCS11_PIN" --list-objects --type cert 2>&1 | tee -a pkcs11-certs-with-pin.txt || true
           else
-            echo "No SIGNUM_PKCS11_PIN provided; skipping login listing." | tee pkcs11-certs-with-pin.txt
+            echo "No SIGNUM_PKCS11_PIN provided; skipping login listing." | tee -a pkcs11-certs-with-pin.txt
           fi
 
-      - name: Export certs and match thumbprint
+      - name: Export certs and generate a readable inventory
         shell: bash
         env:
           SIGNUM_PKCS11_PIN: ${{ secrets.SIGNUM_PKCS11_PIN }}
@@ -118,14 +151,12 @@ jobs:
 
           cat pkcs11-certs.txt pkcs11-certs-with-pin.txt 2>/dev/null > pkcs11-certs-all.txt || true
 
-          echo "== Extract candidate IDs from pkcs11 output =="
-          # pkcs11-tool often prints "ID: <hex>" under objects.
+          echo "== Extract unique IDs from pkcs11 output ==" | tee pkcs11-object-ids.txt
           IDS="$(awk '/^[[:space:]]*ID:/{print $2}' pkcs11-certs-all.txt | sort -u | tr -d '\r')"
-          echo "$IDS" | tee pkcs11-object-ids.txt
+          echo "$IDS" | tee -a pkcs11-object-ids.txt
 
           if [ -z "${IDS}" ]; then
-            echo "No object IDs found in pkcs11 listing output. The module may hide IDs or requires different flags."
-            echo "Inspect pkcs11-certs-all.txt artifact."
+            echo "No object IDs found in pkcs11 listing output. Inspect pkcs11-certs-all.txt." | tee -a pkcs11-object-ids.txt
             exit 1
           fi
 
@@ -144,25 +175,29 @@ jobs:
             fi
           done
 
-          echo "== Compute serial and SHA1 thumbprints for exported certs =="
-          : > cert-matches.txt
+          echo "== Build cert inventory (serial, SHA1 thumbprint, subject, issuer, notBefore, notAfter) ==" | tee cert-inventory.txt
+          : > cert-inventory.txt
           for f in exported-certs/*.der; do
             [ -s "$f" ] || continue
             serial="$(openssl x509 -inform der -in "$f" -noout -serial | cut -d= -f2 | tr '[:lower:]' '[:upper:]')"
             thumb="$(openssl x509 -inform der -in "$f" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d : | tr '[:lower:]' '[:upper:]')"
-            echo "$f serial=$serial thumbprint=$thumb" | tee -a cert-matches.txt
+            subj="$(openssl x509 -inform der -in "$f" -noout -subject | sed 's/^subject=//')"
+            issr="$(openssl x509 -inform der -in "$f" -noout -issuer  | sed 's/^issuer=//')"
+            nb="$(openssl x509 -inform der -in "$f" -noout -startdate | cut -d= -f2)"
+            na="$(openssl x509 -inform der -in "$f" -noout -enddate   | cut -d= -f2)"
+            echo "$f" >> cert-inventory.txt
+            echo "  serial:      $serial" >> cert-inventory.txt
+            echo "  thumbprint:  $thumb" >> cert-inventory.txt
+            echo "  notBefore:   $nb" >> cert-inventory.txt
+            echo "  notAfter:    $na" >> cert-inventory.txt
+            echo "  subject:     $subj" >> cert-inventory.txt
+            echo "  issuer:      $issr" >> cert-inventory.txt
+            echo "" >> cert-inventory.txt
           done
 
-          echo "== Select target cert =="
-          grep -i "${TARGET_THUMBPRINT}" cert-matches.txt | head -n 1 | tee selected-cert.txt
-          if [ ! -s selected-cert.txt ]; then
-            echo "Target thumbprint not found. Check cert-matches.txt."
-            exit 1
-          fi
-
-          echo "### Selected certificate" >> "$GITHUB_STEP_SUMMARY"
+          echo "### PKCS11 certificate inventory (truncated)" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat selected-cert.txt >> "$GITHUB_STEP_SUMMARY"
+          sed -n '1,220p' cert-inventory.txt >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup container
@@ -175,8 +210,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: signum-pkcs11-discovery
+          name: signum-pkcs11-output
           path: |
+            pkcs11-module-error.txt
             pkcs11-module-file.txt
             pkcs11/signum-pkcs11.so
             pkcs11-slots.txt
@@ -185,7 +221,5 @@ jobs:
             pkcs11-certs-all.txt
             pkcs11-object-ids.txt
             exported-certs/
-            cert-matches.txt
-            selected-cert.txt
+            cert-inventory.txt
             signum-agent-startup.log
-            filestosign/example-script.ps1
