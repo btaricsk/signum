@@ -6,7 +6,7 @@ on:
       signum_agent_image:
         description: "Container image to use (include tag)."
         required: false
-        default: "repo.keyfactor.com/signum-cache/signum-agent:4.60.2"
+        default: "keyfactor.jfrog.io/dev-oci-release/signum-agent:latest"
   push:
     branches: ["main"]
     paths:
@@ -19,8 +19,8 @@ jobs:
   sign:
     runs-on: ubuntu-latest
     env:
-      SIGNUM_REGISTRY: repo.keyfactor.com
-      DEFAULT_SIGNUM_AGENT_IMAGE: repo.keyfactor.com/signum-cache/signum-agent:4.60.2
+      SIGNUM_REGISTRY: keyfactor.jfrog.io
+      DEFAULT_SIGNUM_AGENT_IMAGE: keyfactor.jfrog.io/dev-oci-release/signum-agent:latest
 
     steps:
       - name: Checkout
@@ -34,33 +34,28 @@ jobs:
           Support issues: https://support.keyfactor.com/
           EOF
 
-      - name: Docker login to repo.keyfactor.com (decode JFROG_DOCKER_AUTH)
+      # Create these repo secrets:
+      # - JFROG_USERNAME
+      # - JFROG_TOKEN (or password / access token)
+      - name: Docker login (keyfactor.jfrog.io)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.SIGNUM_REGISTRY }}
+          username: ${{ secrets.JFROG_USERNAME }}
+          password: ${{ secrets.JFROG_TOKEN }}
+          logout: true
+
+      - name: Resolve agent image ref
+        id: img
         shell: bash
-        env:
-          JFROG_DOCKER_AUTH: ${{ secrets.JFROG_DOCKER_AUTH }}
         run: |
           set -euo pipefail
-
-          if [[ -z "${JFROG_DOCKER_AUTH:-}" ]]; then
-            echo "ERROR: secrets.JFROG_DOCKER_AUTH is empty/missing."
-            exit 1
+          IMG="${{ inputs.signum_agent_image }}"
+          if [ -z "${IMG}" ]; then
+            IMG="${DEFAULT_SIGNUM_AGENT_IMAGE}"
           fi
-
-          # JFROG_DOCKER_AUTH is expected to be base64("username:password")
-          CREDS="$(echo "${JFROG_DOCKER_AUTH}" | base64 -d || true)"
-          if [[ -z "${CREDS}" || "${CREDS}" != *:* ]]; then
-            echo "ERROR: secrets.JFROG_DOCKER_AUTH did not decode to 'username:password'."
-            exit 1
-          fi
-
-          USERNAME="${CREDS%%:*}"
-          PASSWORD="${CREDS#*:}"
-
-          echo "${PASSWORD}" | docker login "${SIGNUM_REGISTRY}" -u "${USERNAME}" --password-stdin
-
-          echo "== Registry /v2/ probe (helps distinguish auth vs missing repo) =="
-          # 200 or 401/403 usually means registry reachable; 404 sometimes means wrong endpoint/proxy.
-          curl -sS -o /dev/null -w "GET https://${SIGNUM_REGISTRY}/v2/ => HTTP %{http_code}\n" "https://${SIGNUM_REGISTRY}/v2/" || true
+          echo "image=${IMG}" >> "$GITHUB_OUTPUT"
+          echo "Using agent image: ${IMG}"
 
       - name: Run Signum Agent container and list available certs (debug)
         shell: bash
@@ -69,7 +64,7 @@ jobs:
           SIGNUM_CLIENTID: ${{ secrets.SIGNUM_CLIENTID }}
           SIGNUM_USERNAME: ${{ secrets.SIGNUM_USERNAME }}
           SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
-          SIGNUM_AGENT_IMAGE: ${{ inputs.signum_agent_image || env.DEFAULT_SIGNUM_AGENT_IMAGE }}
+          SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
         run: |
           set -euo pipefail
 
@@ -81,7 +76,7 @@ jobs:
           echo "SIGNUM_USERNAME set? $([[ -n "${SIGNUM_USERNAME:-}" ]] && echo yes || echo no)"
           echo "SIGNUM_PASSWORD set? $([[ -n "${SIGNUM_PASSWORD:-}" ]] && echo yes || echo no)"
 
-          echo "== Image ref we will use =="
+          echo "== Image ref we will use (pull+run) =="
           echo "${SIGNUM_AGENT_IMAGE}"
 
           echo "== Ensure there is something to sign =="
@@ -91,18 +86,10 @@ jobs:
           fi
 
           echo "== Pull Signum agent image =="
-          # On GitHub-hosted runners it will never be local, so just pull.
-          # If it fails, dump a bit of diagnostics.
-          if ! docker pull "${SIGNUM_AGENT_IMAGE}"; then
-            echo "ERROR: docker pull failed for ${SIGNUM_AGENT_IMAGE}"
-            echo "== Diagnostics =="
-            echo "Registry: ${SIGNUM_REGISTRY}"
-            echo "Try confirming the repo/tag exists and that the registry endpoint is correct."
-            echo "You can also try pulling a known-good image from the same registry/repo to validate auth."
-            exit 1
-          fi
+          docker pull "${SIGNUM_AGENT_IMAGE}"
 
           echo "== Run container =="
+          docker rm -f signum-agent >/dev/null 2>&1 || true
           docker run --name signum-agent -d \
             -v "$PWD/filestosign:/mnt/filestosign" \
             -e "SIGNUM_HOSTNAME=$SIGNUM_HOSTNAME" \
@@ -114,7 +101,7 @@ jobs:
             "${SIGNUM_AGENT_IMAGE}"
 
           echo "== Container status =="
-          docker ps -a | sed -n '1,10p'
+          docker ps -a | sed -n '1,15p'
 
           echo "== List certs (signum-util lc) =="
           docker exec signum-agent signum-util lc | tee signum-certs.txt
