@@ -7,6 +7,10 @@ on:
         description: "Agent container image to run include tag"
         required: false
         default: "keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1"
+      pkcs11_module_path:
+        description: "Optional path to PKCS11 .so in repo (default pkcs11/signum-pkcs11.so)"
+        required: false
+        default: "pkcs11/signum-pkcs11.so"
   push:
     branches: ["main"]
     paths:
@@ -21,43 +25,32 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DEFAULT_SIGNUM_AGENT_IMAGE: keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1
-      PKCS11_MODULE_PATH: pkcs11/signum-pkcs11.so
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Resolve agent image ref
-        id: img
+      - name: Resolve agent image and module path
+        id: vars
         shell: bash
         run: |
           set -euo pipefail
+
           IMG="${{ github.event.inputs.signum_agent_image }}"
           if [ -z "${IMG}" ]; then
             IMG="${DEFAULT_SIGNUM_AGENT_IMAGE}"
           fi
-          echo "image=${IMG}" >> "$GITHUB_OUTPUT"
-          echo "Using agent image: ${IMG}"
 
-      - name: Validate PKCS11 module exists in repo
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ ! -f "${PKCS11_MODULE_PATH}" ]; then
-            printf '%s\n' \
-              "Missing PKCS11 module at ${PKCS11_MODULE_PATH}" \
-              "This workflow expects the Signum PKCS11 .so to be committed into the repo under pkcs11/" \
-              "Add pkcs11/signum-pkcs11.so (or update PKCS11_MODULE_PATH) and rerun" \
-              | tee pkcs11-module-error.txt
-
-            echo "PKCS11 module missing see artifact pkcs11-module-error.txt" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
+          MODPATH="${{ github.event.inputs.pkcs11_module_path }}"
+          if [ -z "${MODPATH}" ]; then
+            MODPATH="pkcs11/signum-pkcs11.so"
           fi
 
-          chmod 755 "${PKCS11_MODULE_PATH}" || true
-          file "${PKCS11_MODULE_PATH}" | tee pkcs11-module-file.txt
-          ls -la "${PKCS11_MODULE_PATH}"
+          echo "image=${IMG}" >> "$GITHUB_OUTPUT"
+          echo "module_path=${MODPATH}" >> "$GITHUB_OUTPUT"
+
+          echo "Using agent image: ${IMG}"
+          echo "Using module path: ${MODPATH}"
 
       - name: Install PKCS11 tooling
         shell: bash
@@ -73,7 +66,7 @@ jobs:
           SIGNUM_CLIENTID: ${{ secrets.SIGNUM_CLIENTID }}
           SIGNUM_USERNAME: ${{ secrets.SIGNUM_USERNAME }}
           SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
-          SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
+          SIGNUM_AGENT_IMAGE: ${{ steps.vars.outputs.image }}
         run: |
           set -euo pipefail
 
@@ -99,16 +92,63 @@ jobs:
             "${SIGNUM_AGENT_IMAGE}"
 
           docker ps -a | sed -n '1,15p'
-          docker logs signum-agent | tail -n 160 | tee signum-agent-startup.log || true
+          docker logs signum-agent | tail -n 200 | tee signum-agent-startup.log || true
+
+      - name: Locate PKCS11 module (repo first, then container fallback)
+        id: mod
+        shell: bash
+        env:
+          REPO_MODULE_PATH: ${{ steps.vars.outputs.module_path }}
+        run: |
+          set -euo pipefail
+
+          FOUND=""
+
+          echo "== Check repo path: ${REPO_MODULE_PATH} =="
+          if [ -f "${REPO_MODULE_PATH}" ]; then
+            FOUND="${REPO_MODULE_PATH}"
+          fi
+
+          if [ -z "${FOUND}" ]; then
+            echo "== Repo module not found. Attempt search inside container (best effort) =="
+            docker exec signum-agent sh -lc 'find / -maxdepth 7 -type f \( -name "*pkcs11*.so" -o -name "opensc-pkcs11.so" \) 2>/dev/null | sed -n "1,200p"' | tee pkcs11-modules-in-container.txt || true
+            CANDIDATE="$(head -n 1 pkcs11-modules-in-container.txt || true)"
+            if [ -n "${CANDIDATE}" ]; then
+              echo "Found candidate in container: ${CANDIDATE}"
+              docker cp "signum-agent:${CANDIDATE}" ./signum-pkcs11.so
+              chmod 755 ./signum-pkcs11.so || true
+              FOUND="$PWD/signum-pkcs11.so"
+            fi
+          fi
+
+          if [ -z "${FOUND}" ]; then
+            printf '%s\n' \
+              "No PKCS11 module found." \
+              "Expected it in the repo at ${REPO_MODULE_PATH} (commit it under pkcs11/), OR use an agent image that includes it." \
+              "This dev oci agent image does not appear to ship the PKCS11 module." \
+              > pkcs11-module-error.txt
+
+            echo "### PKCS11 module not found" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat pkcs11-module-error.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "module=${FOUND}" >> "$GITHUB_OUTPUT"
+          echo "Using PKCS11 module: ${FOUND}"
+
+          file "${FOUND}" | tee pkcs11-module-file.txt
+          ls -la "${FOUND}"
 
       - name: List all certificates via PKCS11
         shell: bash
         env:
+          MODULE_PATH: ${{ steps.mod.outputs.module }}
           SIGNUM_PKCS11_PIN: ${{ secrets.SIGNUM_PKCS11_PIN }}
         run: |
           set -euo pipefail
-
-          MODULE="$PWD/${PKCS11_MODULE_PATH}"
+          MODULE="${MODULE_PATH}"
 
           echo "== pkcs11-tool list slots ==" | tee pkcs11-slots.txt
           pkcs11-tool --module "$MODULE" --list-slots | tee -a pkcs11-slots.txt
@@ -129,7 +169,7 @@ jobs:
           echo "$IDS" | tee pkcs11-object-ids.txt
 
           if [ -z "${IDS}" ]; then
-            echo "No object IDs found inspect pkcs11-certs-all.txt" | tee pkcs11-inventory-error.txt
+            echo "No object IDs found inspect pkcs11-certs-all.txt"
             exit 1
           fi
 
@@ -168,7 +208,7 @@ jobs:
 
           echo "PKCS11 certificate inventory truncated" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          sed -n '1,240p' cert-inventory.txt >> "$GITHUB_STEP_SUMMARY" || true
+          sed -n '1,260p' cert-inventory.txt >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup container
@@ -185,7 +225,7 @@ jobs:
           path: |
             pkcs11-module-error.txt
             pkcs11-module-file.txt
-            pkcs11-inventory-error.txt
+            pkcs11-modules-in-container.txt
             pkcs11-slots.txt
             pkcs11-certs.txt
             pkcs11-certs-with-pin.txt
@@ -194,3 +234,4 @@ jobs:
             exported-certs/
             cert-inventory.txt
             signum-agent-startup.log
+            signum-pkcs11.so
