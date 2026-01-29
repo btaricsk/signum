@@ -85,14 +85,15 @@ jobs:
           set -euo pipefail
 
           if [ -z "${SIGNUM_PKCS11_MODULE_B64:-}" ]; then
-            cat > pkcs11-module-error.txt <<'EOF'
-SIGNUM_PKCS11_MODULE_B64 is missing base64 of the Signum PKCS11 so
-Common causes
-1 Secret not created in this repo Settings Secrets Actions
-2 Workflow running from a fork forks do not have upstream secrets
-3 Secret is scoped to an Environment but job is not using it
-4 Org secret not shared to this repo
-EOF
+            printf '%s\n' \
+              'SIGNUM_PKCS11_MODULE_B64 is missing base64 of the Signum PKCS11 so' \
+              'Common causes' \
+              '1 Secret not created in this repo Settings Secrets Actions' \
+              '2 Workflow running from a fork forks do not have upstream secrets' \
+              '3 Secret is scoped to an Environment but job is not using it' \
+              '4 Org secret not shared to this repo' \
+              > pkcs11-module-error.txt
+
             echo "PKCS11 module missing see artifacts" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
