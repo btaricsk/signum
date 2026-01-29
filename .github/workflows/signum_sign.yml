@@ -34,9 +34,6 @@ jobs:
           Support issues: https://support.keyfactor.com/
           EOF
 
-      # Required repo secrets:
-      # - JFROG_USERNAME
-      # - JFROG_TOKEN (API token or password)
       - name: Docker login (keyfactor.jfrog.io)
         uses: docker/login-action@v3
         with:
@@ -57,7 +54,7 @@ jobs:
           echo "image=${IMG}" >> "$GITHUB_OUTPUT"
           echo "Using agent image: ${IMG}"
 
-      - name: Run Signum Agent container and list available certs (robust)
+      - name: Run Signum Agent container and attempt cert discovery via API
         shell: bash
         env:
           SIGNUM_HOSTNAME: ${{ secrets.SIGNUM_HOSTNAME }}
@@ -87,9 +84,12 @@ jobs:
           echo "== Pull Signum agent image =="
           docker pull "${SIGNUM_AGENT_IMAGE}"
 
-          echo "== Run container =="
+          echo "== Run container (publish common API ports) =="
           docker rm -f signum-agent >/dev/null 2>&1 || true
           docker run --name signum-agent -d \
+            -p 8080:8080 \
+            -p 5000:5000 \
+            -p 7000:7000 \
             -v "$PWD/filestosign:/mnt/filestosign" \
             -e "SIGNUM_HOSTNAME=$SIGNUM_HOSTNAME" \
             -e "SIGNUM_CLIENTID=$SIGNUM_CLIENTID" \
@@ -100,110 +100,69 @@ jobs:
             "${SIGNUM_AGENT_IMAGE}"
 
           echo "== Container status =="
-          docker ps -a | sed -n '1,15p'
+          docker ps -a | sed -n '1,20p'
+          docker port signum-agent | tee signum-container-ports.txt || true
 
-          echo "== Debug: PATH and root listing =="
-          docker exec signum-agent sh -lc '
-            echo "PATH=$PATH"
-            id || true
-            whoami || true
-            uname -a || true
-            ls -la / || true
-          ' | tee signum-container-debug.txt
+          echo "== Wait briefly for service startup =="
+          sleep 3
 
-          echo "== Inspect Keyfactor directories for CLI =="
-          docker exec signum-agent sh -lc '
-            set -e
-            for d in \
-              /usr/local/keyfactor/bin \
-              /usr/local/keyfactor/service \
-              /usr/local/keyfactor/setup \
-              /opt/keyfactor/jo/bin \
-              /etc/keyfactor/user/.dotnet/tools
-            do
-              if [ -d "$d" ]; then
-                echo "--- $d ---"
-                ls -la "$d" | sed -n "1,200p"
-              fi
+          echo "== Probe agent HTTP endpoints (best effort) =="
+          : > signum-api-probe.txt
+          for port in 8080 5000 7000; do
+            for path in /swagger /swagger/index.html /health /healthz /api/health /api/status /; do
+              url="http://127.0.0.1:${port}${path}"
+              code="$(curl -s -o /dev/null -w '%{http_code}' "$url" || true)"
+              echo "${code} ${url}" | tee -a signum-api-probe.txt
             done
-          ' | tee -a signum-container-debug.txt
+          done
 
-          echo "== Find executables with signum in the name (Keyfactor paths) =="
-          docker exec signum-agent sh -lc '
-            set -e
-            for base in /usr/local/keyfactor /opt/keyfactor /etc/keyfactor; do
-              [ -d "$base" ] || continue
-              find "$base" -maxdepth 5 -type f -name "*signum*" -perm -111 2>/dev/null
-            done
-          ' | tee signum-signum-binaries.txt || true
-
-          echo "== Attempt cert listing (best effort) =="
+          echo "== Attempt cert listing via likely API routes (best effort) =="
+          : > signum-certs.txt
           set +e
-          docker exec signum-agent sh -lc '
-            set -e
-            try() { echo "+ $*"; "$@"; }
-
-            # Try most likely locations/names first.
-            CANDIDATES="
-              /usr/local/keyfactor/bin/signum-util
-              /usr/local/keyfactor/bin/signum
-              /usr/local/keyfactor/bin/signumutil
-              /usr/local/keyfactor/bin/kf-signum
-              /opt/keyfactor/jo/bin/signum
-              /opt/keyfactor/jo/bin/signum-util
-              /etc/keyfactor/user/.dotnet/tools/signum-util
-            "
-
-            for c in $CANDIDATES; do
-              if [ -x "$c" ]; then
-                try "$c" lc || true
-                try "$c" list-certs || true
-                try "$c" --help || true
-                exit 0
-              fi
+          for port in 8080 5000 7000; do
+            for path in \
+              /api/certificates \
+              /api/certs \
+              /api/v1/certificates \
+              /api/v1/certs \
+              /certificates \
+              /certs \
+              /swagger/v1/swagger.json
+            do
+              url="http://127.0.0.1:${port}${path}"
+              echo "== GET ${url} ==" | tee -a signum-certs.txt
+              curl -sS "$url" | head -c 20000 | tee -a signum-certs.txt
+              echo -e "\n" >> signum-certs.txt
             done
-
-            # Fall back: try discovered binaries (up to 20).
-            for c in $(find /usr/local/keyfactor /opt/keyfactor /etc/keyfactor -maxdepth 5 -type f -name "*signum*" -perm -111 2>/dev/null | head -n 20); do
-              try "$c" lc || true
-              try "$c" list-certs || true
-              try "$c" --help || true
-            done
-
-            echo "No cert listing command succeeded."
-            exit 42
-          ' | tee signum-certs.txt
+          done
           CERT_RC=${PIPESTATUS[0]}
           set -e
 
           echo "== Agent logs (tail) =="
-          docker logs signum-agent | tail -n 400 | tee signum-agent.log || true
+          docker logs signum-agent | tail -n 500 | tee signum-agent.log || true
 
           echo "### Signum outputs" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Image:** \`${SIGNUM_AGENT_IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Cert listing exit code:** \`${CERT_RC}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "#### signum-certs.txt" >> "$GITHUB_STEP_SUMMARY"
+          echo "#### API probe" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          sed -n '1,200p' signum-api-probe.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "#### Cert listing attempt (truncated)" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           sed -n '1,200p' signum-certs.txt >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "#### signum-signum-binaries.txt" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          sed -n '1,200p' signum-signum-binaries.txt >> "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "#### signum-agent.log (tail)" >> "$GITHUB_STEP_SUMMARY"
+          echo "#### Agent logs (tail)" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           tail -n 200 signum-agent.log >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-          # Fail after collecting artifacts if cert listing failed.
-          if [ "${CERT_RC}" -ne 0 ]; then
-            echo "Cert listing did not succeed (rc=${CERT_RC}). See artifacts."
-            exit "${CERT_RC}"
-          fi
+          # Don't fail on probe by default; we want artifacts even if routes differ.
+          # If you want strict failure once the correct endpoint is known, we can tighten this later.
+          exit 0
 
       - name: Cleanup container
         if: always()
@@ -218,7 +177,7 @@ jobs:
           name: signum-output
           path: |
             signum-certs.txt
+            signum-api-probe.txt
+            signum-container-ports.txt
             signum-agent.log
-            signum-container-debug.txt
-            signum-signum-binaries.txt
             filestosign/example-script.ps1
