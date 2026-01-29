@@ -6,7 +6,7 @@ on:
       signum_agent_image:
         description: "Container image to use (include tag)."
         required: false
-        default: "repo.keyfactor.com/signum-cache/signum-agent:4.60.2"
+        default: "keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1"
   push:
     branches: ["main"]
     paths:
@@ -19,8 +19,8 @@ jobs:
   sign:
     runs-on: ubuntu-latest
     env:
-      SIGNUM_REGISTRY: repo.keyfactor.com
-      DEFAULT_SIGNUM_AGENT_IMAGE: repo.keyfactor.com/signum-cache/signum-agent:4.60.2
+      SIGNUM_REGISTRY: keyfactor.jfrog.io
+      DEFAULT_SIGNUM_AGENT_IMAGE: keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1
 
     steps:
       - name: Checkout
@@ -34,35 +34,28 @@ jobs:
           Support issues: https://support.keyfactor.com/
           EOF
 
-      - name: Configure Docker auth for repo.keyfactor.com (if provided)
+      # Required repo secrets:
+      # - JFROG_USERNAME
+      # - JFROG_TOKEN (API token or password)
+      - name: Docker login (keyfactor.jfrog.io)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.SIGNUM_REGISTRY }}
+          username: ${{ secrets.JFROG_USERNAME }}
+          password: ${{ secrets.JFROG_TOKEN }}
+          logout: true
+
+      - name: Resolve agent image ref
+        id: img
         shell: bash
-        env:
-          JFROG_DOCKER_AUTH: ${{ secrets.JFROG_DOCKER_AUTH }}
         run: |
           set -euo pipefail
-          if [[ -z "${JFROG_DOCKER_AUTH:-}" ]]; then
-            echo "JFROG_DOCKER_AUTH not set; will skip writing ~/.docker/config.json and rely on public/other auth if needed."
-            exit 0
+          IMG="${{ inputs.signum_agent_image }}"
+          if [ -z "${IMG}" ]; then
+            IMG="${DEFAULT_SIGNUM_AGENT_IMAGE}"
           fi
-
-          mkdir -p ~/.docker
-          cat > ~/.docker/config.json <<EOF
-          {
-            "auths": {
-              "${SIGNUM_REGISTRY}": {
-                "auth": "${JFROG_DOCKER_AUTH}"
-              }
-            }
-          }
-          EOF
-
-          echo "== Docker auth configured for =="
-          python3 - <<'PY'
-          import json, os
-          with open(os.path.expanduser("~/.docker/config.json")) as f:
-              cfg=json.load(f)
-          print(list(cfg.get("auths", {}).keys()))
-          PY
+          echo "image=${IMG}" >> "$GITHUB_OUTPUT"
+          echo "Using agent image: ${IMG}"
 
       - name: Run Signum Agent container and list available certs (debug)
         shell: bash
@@ -71,8 +64,7 @@ jobs:
           SIGNUM_CLIENTID: ${{ secrets.SIGNUM_CLIENTID }}
           SIGNUM_USERNAME: ${{ secrets.SIGNUM_USERNAME }}
           SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
-
-          SIGNUM_AGENT_IMAGE: ${{ inputs.signum_agent_image || env.DEFAULT_SIGNUM_AGENT_IMAGE }}
+          SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
         run: |
           set -euo pipefail
 
@@ -84,7 +76,7 @@ jobs:
           echo "SIGNUM_USERNAME set? $([[ -n "${SIGNUM_USERNAME:-}" ]] && echo yes || echo no)"
           echo "SIGNUM_PASSWORD set? $([[ -n "${SIGNUM_PASSWORD:-}" ]] && echo yes || echo no)"
 
-          echo "== Image ref we will use =="
+          echo "== Image ref we will use (pull+run) =="
           echo "${SIGNUM_AGENT_IMAGE}"
 
           echo "== Ensure there is something to sign =="
@@ -93,17 +85,11 @@ jobs:
             echo 'Write-Host "Hello from Signum signing demo"' > filestosign/example-script.ps1
           fi
 
-          echo "== Use local image if present, otherwise pull from registry =="
-          if docker image inspect "${SIGNUM_AGENT_IMAGE}" >/dev/null 2>&1; then
-            echo "Using local image: ${SIGNUM_AGENT_IMAGE}"
-          else
-            echo "Local image not found. Validating manifest and pulling from registry: ${SIGNUM_AGENT_IMAGE}"
-            # manifest inspect will fail early if the image ref is invalid for the registry
-            docker manifest inspect "${SIGNUM_AGENT_IMAGE}" >/dev/null
-            docker pull "${SIGNUM_AGENT_IMAGE}"
-          fi
+          echo "== Pull Signum agent image =="
+          docker pull "${SIGNUM_AGENT_IMAGE}"
 
           echo "== Run container =="
+          docker rm -f signum-agent >/dev/null 2>&1 || true
           docker run --name signum-agent -d \
             -v "$PWD/filestosign:/mnt/filestosign" \
             -e "SIGNUM_HOSTNAME=$SIGNUM_HOSTNAME" \
@@ -115,25 +101,14 @@ jobs:
             "${SIGNUM_AGENT_IMAGE}"
 
           echo "== Container status =="
-          docker ps -a | sed -n '1,10p'
-
-          echo "== Wait for signum agent to become ready (basic wait) =="
-          # adjust timeout/wait logic if needed
-          for i in {1..20}; do
-            if docker exec signum-agent sh -c "command -v signum-util >/dev/null 2>&1"; then
-              echo "signum-util present in container"
-              break
-            fi
-            echo "waiting for signum agent startup... ($i/20)"
-            sleep 3
-          done
+          docker ps -a | sed -n '1,15p'
 
           echo "== List certs (signum-util lc) =="
-          docker exec signum-agent signum-util lc | tee signum-certs.txt || true
+          docker exec signum-agent signum-util lc | tee signum-certs.txt
 
           echo "### Signum cert listing (signum-util lc)" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat signum-certs.txt >> "$GITHUB_STEP_SUMMARY" || true
+          cat signum-certs.txt >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup container
