@@ -49,12 +49,13 @@ jobs:
         id: img
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $img = "${{ inputs.signum_agent_image }}"
           if ([string]::IsNullOrWhiteSpace($img)) {
             $img = $env:DEFAULT_SIGNUM_AGENT_IMAGE
           }
           "image=$img" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "Using agent image: $img"
+          Write-Host "Using agent image: $img"
 
       - name: Run Signum Agent container and list available certs (debug)
         shell: pwsh
@@ -71,10 +72,9 @@ jobs:
           Write-Host ("Runner OS: " + (Get-CimInstance Win32_OperatingSystem).Caption)
           docker --version | Write-Host
 
-          Write-Host ("SIGNUM_HOSTNAME set? " + ($(if ($env:SIGNUM_HOSTNAME) { "yes" } else { "no" })))
-          Write-Host ("SIGNUM_CLIENTID set? " + ($(if ($env:SIGNUM_CLIENTID) { "yes" } else { "no" })))
-          Write-Host ("SIGNUM_USERNAME set? " + ($(if ($env:SIGNUM_USERNAME) { "yes" } else { "no" })))
-          Write-Host ("SIGNUM_PASSWORD set? " + ($(if ($env:SIGNUM_PASSWORD) { "yes" } else { "no" })))
+          foreach ($k in "SIGNUM_HOSTNAME","SIGNUM_CLIENTID","SIGNUM_USERNAME","SIGNUM_PASSWORD") {
+            Write-Host ("{0} set? {1}" -f $k, ($(if ($env:$k) { "yes" } else { "no" })))
+          }
 
           Write-Host "== Image ref we will use (pull+run) =="
           Write-Host $env:SIGNUM_AGENT_IMAGE
@@ -91,9 +91,8 @@ jobs:
           Write-Host "== Run container =="
           docker rm -f signum-agent 2>$null | Out-Null
 
-          # Use absolute Windows path for bind mount reliability on Windows runners
-          $repoRoot = (Get-Location).Path
-          $hostMount = Join-Path $repoRoot "filestosign"
+          # Use absolute Windows path and normalize for Docker bind mount reliability
+          $hostMount = (Resolve-Path "filestosign").Path -replace '\\','/'
 
           docker run --name signum-agent -d `
             -v "${hostMount}:/mnt/filestosign" `
@@ -109,7 +108,26 @@ jobs:
           docker ps -a
 
           Write-Host "== List certs (signum-util lc) =="
-          docker exec signum-agent signum-util lc | Tee-Object -FilePath "signum-certs.txt"
+          $maxAttempts = 6
+          $delaySeconds = 5
+          $ok = $false
+
+          for ($i=1; $i -le $maxAttempts; $i++) {
+            try {
+              docker exec signum-agent signum-util lc | Tee-Object -FilePath "signum-certs.txt" | Out-Null
+              $ok = $true
+              break
+            } catch {
+              Write-Host "Attempt $i/$maxAttempts failed. Waiting $delaySeconds seconds..."
+              Start-Sleep -Seconds $delaySeconds
+            }
+          }
+
+          if (-not $ok) {
+            Write-Host "signum-util lc failed after retries. Dumping container logs:"
+            docker logs signum-agent
+            throw "Failed to list certs from Signum agent."
+          }
 
           "### Signum cert listing (signum-util lc)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           "```" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
