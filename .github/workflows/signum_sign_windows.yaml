@@ -47,7 +47,13 @@ jobs:
             docker --version | Write-Host
 
             # Fail fast if required env vars aren't present (no secrets printed)
-            $required = @("SIGNUM_HOSTNAME","SIGNUM_CLIENTID","SIGNUM_USERNAME","SIGNUM_PASSWORD","SIGNUM_AGENT_IMAGE")
+            $required = @(
+              "SIGNUM_HOSTNAME",
+              "SIGNUM_CLIENTID",
+              "SIGNUM_USERNAME",
+              "SIGNUM_PASSWORD",
+              "SIGNUM_AGENT_IMAGE"
+            )
             $missing = @()
             foreach ($k in $required) {
               $val = [Environment]::GetEnvironmentVariable($k)
@@ -114,9 +120,10 @@ jobs:
               throw "Failed to list certs from Signum agent."
             }
 
+            # Append cert listing to the GitHub step summary (safe - doesn't print secrets)
             "### Signum cert listing (signum-util lc)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
             "```" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-            Get-Content "signum-certs.txt" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            Get-Content "signum-certs.txt" | ForEach-Object { $_ } | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
             "```" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           }
           finally {
