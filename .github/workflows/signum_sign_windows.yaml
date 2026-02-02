@@ -1,150 +1,68 @@
-name: Sign document with Signum Container Agent (basic)
+$ErrorActionPreference = "Stop"
 
-on:
-  workflow_dispatch:
-    inputs:
-      signum_agent_image:
-        description: "Container image to use (include tag)."
-        required: false
-        default: "keyfactor.jfrog.io/dev-oci-release/signum-agent:latest"
-  push:
-    branches: ["main"]
-    paths:
-      - "filestosign/**"
+Write-Host "== Basic checks =="
+Write-Host ("Runner OS: " + (Get-CimInstance Win32_OperatingSystem).Caption)
+docker --version | Write-Host
 
-permissions:
-  contents: read
+foreach ($k in @("SIGNUM_HOSTNAME","SIGNUM_CLIENTID","SIGNUM_USERNAME","SIGNUM_PASSWORD")) {
+  $val = [Environment]::GetEnvironmentVariable($k)
+  Write-Host ("{0} set? {1}" -f $k, ($(if ([string]::IsNullOrWhiteSpace($val)) { "no" } else { "yes" })))
+}
 
-jobs:
-  sign:
-    runs-on: windows-latest
-    env:
-      SIGNUM_REGISTRY: keyfactor.jfrog.io
-      DEFAULT_SIGNUM_AGENT_IMAGE: keyfactor.jfrog.io/dev-oci-release/signum-agent:latest
+Write-Host "== Image ref we will use (pull+run) =="
+Write-Host $env:SIGNUM_AGENT_IMAGE
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+Write-Host "== Ensure there is something to sign =="
+New-Item -ItemType Directory -Force -Path "filestosign" | Out-Null
+if (-not (Test-Path "filestosign\example-script.ps1")) {
+  'Write-Host "Hello from Signum signing demo"' | Out-File -FilePath "filestosign\example-script.ps1" -Encoding utf8
+}
 
-      - name: Notes / Support Disclaimer
-        shell: pwsh
-        run: |
-          @"
-          ## Signum Container Agent with Signing Tools – Support / Usage Notes
-          Support issues: https://support.keyfactor.com/
-          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+Write-Host "== Pull Signum agent image =="
+docker pull $env:SIGNUM_AGENT_IMAGE
 
-      # Create these repo secrets:
-      # - JFROG_USERNAME
-      # - JFROG_TOKEN (or password / access token)
-      - name: Docker login (keyfactor.jfrog.io)
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.SIGNUM_REGISTRY }}
-          username: ${{ secrets.JFROG_USERNAME }}
-          password: ${{ secrets.JFROG_TOKEN }}
-          logout: true
+Write-Host "== Run container =="
+docker rm -f signum-agent 2>$null | Out-Null
 
-      - name: Resolve agent image ref
-        id: img
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $img = "${{ inputs.signum_agent_image }}"
-          if ([string]::IsNullOrWhiteSpace($img)) {
-            $img = $env:DEFAULT_SIGNUM_AGENT_IMAGE
-          }
-          "image=$img" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Write-Host "Using agent image: $img"
+# Use absolute Windows path and normalize for Docker bind mount reliability
+$hostMount = (Resolve-Path "filestosign").Path -replace '\\','/'
 
-      - name: Run Signum Agent container and list available certs (debug)
-        shell: pwsh
-        env:
-          SIGNUM_HOSTNAME: ${{ secrets.SIGNUM_HOSTNAME }}
-          SIGNUM_CLIENTID: ${{ secrets.SIGNUM_CLIENTID }}
-          SIGNUM_USERNAME: ${{ secrets.SIGNUM_USERNAME }}
-          SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
-          SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
-        run: |
-          $ErrorActionPreference = "Stop"
+docker run --name signum-agent -d `
+  -v "${hostMount}:/mnt/filestosign" `
+  -e "SIGNUM_HOSTNAME=$env:SIGNUM_HOSTNAME" `
+  -e "SIGNUM_CLIENTID=$env:SIGNUM_CLIENTID" `
+  -e "SIGNUM_USERNAME=$env:SIGNUM_USERNAME" `
+  -e "SIGNUM_PASSWORD=$env:SIGNUM_PASSWORD" `
+  -e "SIGNUM_LOGLEVEL=HIGH" `
+  -e "SIGNUM_LOGTYPE=FILE" `
+  $env:SIGNUM_AGENT_IMAGE | Out-Null
 
-          Write-Host "== Basic checks =="
-          Write-Host ("Runner OS: " + (Get-CimInstance Win32_OperatingSystem).Caption)
-          docker --version | Write-Host
+Write-Host "== Container status =="
+docker ps -a
 
-          foreach ($k in "SIGNUM_HOSTNAME","SIGNUM_CLIENTID","SIGNUM_USERNAME","SIGNUM_PASSWORD") {
-            Write-Host ("{0} set? {1}" -f $k, ($(if ($env:$k) { "yes" } else { "no" })))
-          }
+Write-Host "== List certs (signum-util lc) =="
+$maxAttempts = 6
+$delaySeconds = 5
+$ok = $false
 
-          Write-Host "== Image ref we will use (pull+run) =="
-          Write-Host $env:SIGNUM_AGENT_IMAGE
+for ($i=1; $i -le $maxAttempts; $i++) {
+  try {
+    docker exec signum-agent signum-util lc | Tee-Object -FilePath "signum-certs.txt" | Out-Null
+    $ok = $true
+    break
+  } catch {
+    Write-Host "Attempt $i/$maxAttempts failed. Waiting $delaySeconds seconds..."
+    Start-Sleep -Seconds $delaySeconds
+  }
+}
 
-          Write-Host "== Ensure there is something to sign =="
-          New-Item -ItemType Directory -Force -Path "filestosign" | Out-Null
-          if (-not (Test-Path "filestosign\example-script.ps1")) {
-            'Write-Host "Hello from Signum signing demo"' | Out-File -FilePath "filestosign\example-script.ps1" -Encoding utf8
-          }
+if (-not $ok) {
+  Write-Host "signum-util lc failed after retries. Dumping container logs:"
+  docker logs signum-agent
+  throw "Failed to list certs from Signum agent."
+}
 
-          Write-Host "== Pull Signum agent image =="
-          docker pull $env:SIGNUM_AGENT_IMAGE
-
-          Write-Host "== Run container =="
-          docker rm -f signum-agent 2>$null | Out-Null
-
-          # Use absolute Windows path and normalize for Docker bind mount reliability
-          $hostMount = (Resolve-Path "filestosign").Path -replace '\\','/'
-
-          docker run --name signum-agent -d `
-            -v "${hostMount}:/mnt/filestosign" `
-            -e "SIGNUM_HOSTNAME=$env:SIGNUM_HOSTNAME" `
-            -e "SIGNUM_CLIENTID=$env:SIGNUM_CLIENTID" `
-            -e "SIGNUM_USERNAME=$env:SIGNUM_USERNAME" `
-            -e "SIGNUM_PASSWORD=$env:SIGNUM_PASSWORD" `
-            -e "SIGNUM_LOGLEVEL=HIGH" `
-            -e "SIGNUM_LOGTYPE=FILE" `
-            $env:SIGNUM_AGENT_IMAGE | Out-Null
-
-          Write-Host "== Container status =="
-          docker ps -a
-
-          Write-Host "== List certs (signum-util lc) =="
-          $maxAttempts = 6
-          $delaySeconds = 5
-          $ok = $false
-
-          for ($i=1; $i -le $maxAttempts; $i++) {
-            try {
-              docker exec signum-agent signum-util lc | Tee-Object -FilePath "signum-certs.txt" | Out-Null
-              $ok = $true
-              break
-            } catch {
-              Write-Host "Attempt $i/$maxAttempts failed. Waiting $delaySeconds seconds..."
-              Start-Sleep -Seconds $delaySeconds
-            }
-          }
-
-          if (-not $ok) {
-            Write-Host "signum-util lc failed after retries. Dumping container logs:"
-            docker logs signum-agent
-            throw "Failed to list certs from Signum agent."
-          }
-
-          "### Signum cert listing (signum-util lc)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-          "```" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-          Get-Content "signum-certs.txt" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-          "```" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-
-      - name: Cleanup container
-        if: always()
-        shell: pwsh
-        run: |
-          docker rm -f signum-agent 2>$null | Out-Null
-
-      - name: Upload output
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: signum-output
-          path: |
-            signum-certs.txt
-            filestosign/example-script.ps1
+"### Signum cert listing (signum-util lc)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+"```" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+Get-Content "signum-certs.txt" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+"```" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
