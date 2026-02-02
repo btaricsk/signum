@@ -1,12 +1,7 @@
-name: Signum Agent (Windows runner) - List certs
+name: Signum Agent (Windows) - List certs
 
 on:
   workflow_dispatch:
-    inputs:
-      signum_agent_image:
-        description: "Container image to use (include tag). Leave blank to use default."
-        required: false
-        default: ""
   push:
     branches: ["main"]
     paths:
@@ -19,21 +14,14 @@ permissions:
 jobs:
   sign:
     runs-on: windows-latest
+
     env:
       SIGNUM_REGISTRY: keyfactor.jfrog.io
-      DEFAULT_SIGNUM_AGENT_IMAGE: keyfactor.jfrog.io/dev-oci-release/signum-agent:latest
+      SIGNUM_AGENT_IMAGE: keyfactor.jfrog.io/dev-oci/signum-agent:4.20.1
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Notes / Support Disclaimer
-        shell: pwsh
-        run: |
-          @"
-          ## Signum Container Agent with Signing Tools – Support / Usage Notes
-          Support issues: https://support.keyfactor.com/
-          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: Docker login (keyfactor.jfrog.io)
         uses: docker/login-action@v3
@@ -43,25 +31,13 @@ jobs:
           password: ${{ secrets.JFROG_TOKEN }}
           logout: true
 
-      - name: Resolve agent image ref
-        id: img
-        shell: pwsh
-        run: |
-          $img = "${{ inputs.signum_agent_image }}"
-          if ([string]::IsNullOrWhiteSpace($img)) {
-            $img = $env:DEFAULT_SIGNUM_AGENT_IMAGE
-          }
-          "image=$img" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "Using agent image: $img"
-
-      - name: Run Signum Agent container and list available certs (debug)
+      - name: Run Signum Agent container and list certs
         shell: pwsh
         env:
           SIGNUM_HOSTNAME: ${{ secrets.SIGNUM_HOSTNAME }}
           SIGNUM_CLIENTID: ${{ secrets.SIGNUM_CLIENTID }}
           SIGNUM_USERNAME: ${{ secrets.SIGNUM_USERNAME }}
           SIGNUM_PASSWORD: ${{ secrets.SIGNUM_PASSWORD }}
-          SIGNUM_AGENT_IMAGE: ${{ steps.img.outputs.image }}
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -85,8 +61,7 @@ jobs:
             Write-Host "== Ensure there is something to sign =="
             New-Item -ItemType Directory -Force -Path "filestosign" | Out-Null
             if (-not (Test-Path "filestosign\example-script.ps1")) {
-              'Write-Host "Hello from Signum signing demo"' |
-                Out-File -FilePath "filestosign\example-script.ps1" -Encoding utf8
+              'Write-Host "Hello from Signum signing demo"' | Out-File -FilePath "filestosign\example-script.ps1" -Encoding utf8
             }
 
             Write-Host "== Pull Signum agent image =="
@@ -120,6 +95,11 @@ jobs:
               try {
                 docker exec signum-agent signum-util lc |
                   Tee-Object -FilePath "signum-certs.txt" | Out-Null
+
+                if ($LASTEXITCODE -ne 0) {
+                  throw "docker exec returned exit code $LASTEXITCODE"
+                }
+
                 $ok = $true
                 break
               } catch {
