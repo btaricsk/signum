@@ -1,68 +1,81 @@
 $ErrorActionPreference = "Stop"
 
-Write-Host "== Basic checks =="
-Write-Host ("Runner OS: " + (Get-CimInstance Win32_OperatingSystem).Caption)
-docker --version | Write-Host
+try {
+  Write-Host "== Basic checks =="
+  Write-Host ("Runner OS: " + (Get-CimInstance Win32_OperatingSystem).Caption)
+  docker --version | Write-Host
 
-foreach ($k in @("SIGNUM_HOSTNAME","SIGNUM_CLIENTID","SIGNUM_USERNAME","SIGNUM_PASSWORD")) {
-  $val = [Environment]::GetEnvironmentVariable($k)
-  Write-Host ("{0} set? {1}" -f $k, ($(if ([string]::IsNullOrWhiteSpace($val)) { "no" } else { "yes" })))
-}
-
-Write-Host "== Image ref we will use (pull+run) =="
-Write-Host $env:SIGNUM_AGENT_IMAGE
-
-Write-Host "== Ensure there is something to sign =="
-New-Item -ItemType Directory -Force -Path "filestosign" | Out-Null
-if (-not (Test-Path "filestosign\example-script.ps1")) {
-  'Write-Host "Hello from Signum signing demo"' | Out-File -FilePath "filestosign\example-script.ps1" -Encoding utf8
-}
-
-Write-Host "== Pull Signum agent image =="
-docker pull $env:SIGNUM_AGENT_IMAGE
-
-Write-Host "== Run container =="
-docker rm -f signum-agent 2>$null | Out-Null
-
-# Use absolute Windows path and normalize for Docker bind mount reliability
-$hostMount = (Resolve-Path "filestosign").Path -replace '\\','/'
-
-docker run --name signum-agent -d `
-  -v "${hostMount}:/mnt/filestosign" `
-  -e "SIGNUM_HOSTNAME=$env:SIGNUM_HOSTNAME" `
-  -e "SIGNUM_CLIENTID=$env:SIGNUM_CLIENTID" `
-  -e "SIGNUM_USERNAME=$env:SIGNUM_USERNAME" `
-  -e "SIGNUM_PASSWORD=$env:SIGNUM_PASSWORD" `
-  -e "SIGNUM_LOGLEVEL=HIGH" `
-  -e "SIGNUM_LOGTYPE=FILE" `
-  $env:SIGNUM_AGENT_IMAGE | Out-Null
-
-Write-Host "== Container status =="
-docker ps -a
-
-Write-Host "== List certs (signum-util lc) =="
-$maxAttempts = 6
-$delaySeconds = 5
-$ok = $false
-
-for ($i=1; $i -le $maxAttempts; $i++) {
-  try {
-    docker exec signum-agent signum-util lc | Tee-Object -FilePath "signum-certs.txt" | Out-Null
-    $ok = $true
-    break
-  } catch {
-    Write-Host "Attempt $i/$maxAttempts failed. Waiting $delaySeconds seconds..."
-    Start-Sleep -Seconds $delaySeconds
+  # Fail fast if required env vars aren't present (no secrets printed)
+  $required = @("SIGNUM_HOSTNAME","SIGNUM_CLIENTID","SIGNUM_USERNAME","SIGNUM_PASSWORD","SIGNUM_AGENT_IMAGE")
+  $missing = @()
+  foreach ($k in $required) {
+    $val = [Environment]::GetEnvironmentVariable($k)
+    Write-Host ("{0} set? {1}" -f $k, ($(if ([string]::IsNullOrWhiteSpace($val)) { "no" } else { "yes" })))
+    if ([string]::IsNullOrWhiteSpace($val)) { $missing += $k }
   }
-}
+  if ($missing.Count -gt 0) {
+    throw ("Missing required environment variable(s): " + ($missing -join ", "))
+  }
 
-if (-not $ok) {
-  Write-Host "signum-util lc failed after retries. Dumping container logs:"
-  docker logs signum-agent
-  throw "Failed to list certs from Signum agent."
-}
+  Write-Host "== Image ref we will use (pull+run) =="
+  Write-Host $env:SIGNUM_AGENT_IMAGE
 
-"### Signum cert listing (signum-util lc)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-"```" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-Get-Content "signum-certs.txt" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-"```" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+  Write-Host "== Ensure there is something to sign =="
+  New-Item -ItemType Directory -Force -Path "filestosign" | Out-Null
+  if (-not (Test-Path "filestosign\example-script.ps1")) {
+    'Write-Host "Hello from Signum signing demo"' | Out-File -FilePath "filestosign\example-script.ps1" -Encoding utf8
+  }
+
+  Write-Host "== Pull Signum agent image =="
+  docker pull $env:SIGNUM_AGENT_IMAGE
+
+  Write-Host "== Run container =="
+  docker rm -f signum-agent 2>$null | Out-Null
+
+  # Absolute Windows path -> normalized to forward slashes for Docker bind mount
+  $hostMount = (Resolve-Path "filestosign").Path -replace '\\','/'
+
+  docker run --name signum-agent -d `
+    -v "${hostMount}:/mnt/filestosign" `
+    -e "SIGNUM_HOSTNAME=$env:SIGNUM_HOSTNAME" `
+    -e "SIGNUM_CLIENTID=$env:SIGNUM_CLIENTID" `
+    -e "SIGNUM_USERNAME=$env:SIGNUM_USERNAME" `
+    -e "SIGNUM_PASSWORD=$env:SIGNUM_PASSWORD" `
+    -e "SIGNUM_LOGLEVEL=HIGH" `
+    -e "SIGNUM_LOGTYPE=FILE" `
+    $env:SIGNUM_AGENT_IMAGE | Out-Null
+
+  Write-Host "== Container status =="
+  docker ps -a
+
+  Write-Host "== List certs (signum-util lc) =="
+  $maxAttempts = 6
+  $delaySeconds = 5
+  $ok = $false
+
+  for ($i = 1; $i -le $maxAttempts; $i++) {
+    try {
+      docker exec signum-agent signum-util lc | Tee-Object -FilePath "signum-certs.txt" | Out-Null
+      $ok = $true
+      break
+    } catch {
+      Write-Host "Attempt $i/$maxAttempts failed. Waiting $delaySeconds seconds..."
+      Start-Sleep -Seconds $delaySeconds
+    }
+  }
+
+  if (-not $ok) {
+    Write-Host "signum-util lc failed after retries. Dumping container logs:"
+    docker logs signum-agent
+    throw "Failed to list certs from Signum agent."
+  }
+
+  "### Signum cert listing (signum-util lc)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+  "```" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+  Get-Content "signum-certs.txt" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+  "```" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+}
+finally {
+  # Always cleanup
+  docker rm -f signum-agent 2>$null | Out-Null
+}
